@@ -38,13 +38,13 @@ async fn roundtrip(client: std::sync::Arc<Client>, service: &str) -> std::io::Re
 async fn allowed_peer_reaches_service_and_stranger_does_not() {
     let (server_key, good, bad) = (Key::generate(), Key::generate(), Key::generate());
     let services = HashMap::from([("echo".to_string(), echo_server().await)]);
-    let router = serve(server_key.clone(), services, [good.public()].into()).await.unwrap();
+    let router = serve(server_key.clone(), None, services, [good.public()].into()).await.unwrap();
     router.endpoint().online().await;
 
-    let ok = Client::new(good, server_key.public()).await.unwrap();
+    let ok = Client::new(good, server_key.public(), None).await.unwrap();
     assert_eq!(roundtrip(ok.clone(), "echo").await.unwrap(), b"hello");
     assert!(roundtrip(ok, "nope").await.is_err(), "unknown service must not connect");
 
-    let stranger = Client::new(bad, server_key.public()).await.unwrap();
+    let stranger = Client::new(bad, server_key.public(), None).await.unwrap();
     assert!(roundtrip(stranger, "echo").await.is_err(), "non-allowlisted peer must be rejected");
 }

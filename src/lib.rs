@@ -11,17 +11,18 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use iroh::{
-    Endpoint, EndpointId, SecretKey,
+    Endpoint, EndpointId, RelayMode, SecretKey,
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
+use n0_future::StreamExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional, join},
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
 
-pub use iroh::{EndpointId as PeerId, SecretKey as Key};
+pub use iroh::{EndpointId as PeerId, RelayUrl, SecretKey as Key};
 
 pub const ALPN: &[u8] = b"iroh-proxy/0";
 
@@ -46,8 +47,30 @@ pub fn load_or_create_key(path: impl AsRef<Path>) -> Result<SecretKey> {
     }
 }
 
-async fn bind(key: SecretKey) -> Result<Endpoint> {
-    Ok(Endpoint::builder(presets::N0).secret_key(key).bind().await?)
+/// `relay`: your own iroh-relay instead of n0's public ones. Set the same one on both ends.
+async fn bind(key: SecretKey, relay: Option<RelayUrl>) -> Result<Endpoint> {
+    let mut b = Endpoint::builder(presets::N0).secret_key(key);
+    if let Some(url) = relay {
+        b = b.relay_mode(RelayMode::Custom(url.into()));
+    }
+    Ok(b.bind().await?)
+}
+
+/// Logs the connection's selected path (direct UDP or relay) each time it changes.
+fn log_paths(conn: Connection) {
+    tokio::spawn(async move {
+        let peer = conn.remote_id().fmt_short();
+        let mut last = String::new();
+        let mut paths = conn.paths_stream();
+        while let Some(list) = paths.next().await {
+            let Some(p) = list.iter().find(|p| p.is_selected()) else { continue };
+            let now = format!("{} ({})", if p.is_relay() { "relayed" } else { "direct" }, p.remote_addr());
+            if now != last {
+                eprintln!("{peer}: {now} (rtt {:?})", p.rtt());
+                last = now;
+            }
+        }
+    });
 }
 
 // ---------- server ----------
@@ -66,7 +89,8 @@ impl ProtocolHandler for Proxy {
             conn.close(1u32.into(), b"not allowed");
             return Ok(());
         }
-        eprintln!("connected {peer}");
+        eprintln!("connected {}", peer.fmt_short());
+        log_paths(conn.clone());
         while let Ok((send, recv)) = conn.accept_bi().await {
             let services = self.services.clone();
             tokio::spawn(async move {
@@ -91,9 +115,14 @@ async fn serve_stream(services: &HashMap<String, String>, send: SendStream, mut 
 }
 
 /// Starts serving `services` (name -> "host:port") to `allowed` peers. Drop/shutdown the Router to stop.
-pub async fn serve(key: SecretKey, services: HashMap<String, String>, allowed: HashSet<EndpointId>) -> Result<Router> {
+pub async fn serve(
+    key: SecretKey,
+    relay: Option<RelayUrl>,
+    services: HashMap<String, String>,
+    allowed: HashSet<EndpointId>,
+) -> Result<Router> {
     let proxy = Proxy { services: Arc::new(services), allowed: Arc::new(allowed) };
-    Ok(Router::builder(bind(key).await?).accept(ALPN, proxy).spawn())
+    Ok(Router::builder(bind(key, relay).await?).accept(ALPN, proxy).spawn())
 }
 
 // ---------- client ----------
@@ -105,8 +134,8 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn new(key: SecretKey, server: EndpointId) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self { ep: bind(key).await?, server, conn: Mutex::new(None) }))
+    pub async fn new(key: SecretKey, server: EndpointId, relay: Option<RelayUrl>) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self { ep: bind(key, relay).await?, server, conn: Mutex::new(None) }))
     }
 
     pub fn id(&self) -> EndpointId {
@@ -124,6 +153,7 @@ impl Client {
         }
         let c = self.ep.connect(self.server, ALPN).await?;
         let s = c.open_bi().await?;
+        log_paths(c.clone());
         *conn = Some(c);
         Ok(s)
     }
@@ -154,7 +184,12 @@ impl Client {
 
 /// For non-tokio apps (e.g. jellyui): starts a background thread that forwards
 /// `127.0.0.1:<random port>` to `service` and returns that address. Runs for the process lifetime.
-pub fn forward_in_background(key: SecretKey, server: EndpointId, service: &str) -> Result<SocketAddr> {
+pub fn forward_in_background(
+    key: SecretKey,
+    server: EndpointId,
+    relay: Option<RelayUrl>,
+    service: &str,
+) -> Result<SocketAddr> {
     let (tx, rx) = std::sync::mpsc::channel();
     let service = service.to_owned();
     std::thread::Builder::new().name("iroh-proxy".into()).spawn(move || {
@@ -168,7 +203,7 @@ pub fn forward_in_background(key: SecretKey, server: EndpointId, service: &str) 
         rt.block_on(async move {
             let setup = async {
                 let listener = TcpListener::bind("127.0.0.1:0").await?;
-                anyhow::Ok((Client::new(key, server).await?, listener))
+                anyhow::Ok((Client::new(key, server, relay).await?, listener))
             };
             match setup.await {
                 Ok((client, listener)) => {

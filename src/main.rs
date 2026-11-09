@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use iroh_proxy::{Client, PeerId, load_or_create_key};
+use iroh_proxy::{Client, PeerId, RelayUrl, load_or_create_key};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
 #[derive(Deserialize)]
 struct ServerConfig {
     key_file: String,
+    relay: Option<RelayUrl>,
     /// Client endpoint ids allowed to connect.
     allowed: HashSet<PeerId>,
     /// name -> "host:port" on the homelab side.
@@ -17,6 +18,7 @@ struct ServerConfig {
 #[derive(Deserialize)]
 struct ClientConfig {
     key_file: String,
+    relay: Option<RelayUrl>,
     server: PeerId,
     /// service name -> local "host:port" to listen on.
     forwards: HashMap<String, String>,
@@ -33,14 +35,14 @@ async fn main() -> Result<()> {
     match (args.get(1).map(String::as_str), args.get(2)) {
         (Some("serve"), Some(path)) => {
             let cfg: ServerConfig = load(path)?;
-            let router = iroh_proxy::serve(load_or_create_key(&cfg.key_file)?, cfg.services, cfg.allowed).await?;
+            let router = iroh_proxy::serve(load_or_create_key(&cfg.key_file)?, cfg.relay, cfg.services, cfg.allowed).await?;
             println!("server id: {}", router.endpoint().id());
             tokio::signal::ctrl_c().await?;
             router.shutdown().await?;
         }
         (Some("connect"), Some(path)) => {
             let cfg: ClientConfig = load(path)?;
-            let client = Client::new(load_or_create_key(&cfg.key_file)?, cfg.server).await?;
+            let client = Client::new(load_or_create_key(&cfg.key_file)?, cfg.server, cfg.relay).await?;
             println!("client id: {} (add to server's `allowed`)", client.id());
             for (service, local) in cfg.forwards {
                 let listener = TcpListener::bind(&local).await.with_context(|| format!("binding {local}"))?;
