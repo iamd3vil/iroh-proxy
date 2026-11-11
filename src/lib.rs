@@ -1,12 +1,18 @@
 //! Expose named TCP services from one iroh endpoint to an allowlist of peers.
 //!
-//! Wire protocol, per QUIC bi-stream: `u8 len` + service name, then raw bytes both ways.
+//! TCP: per QUIC bi-stream, `u8 len` + service name, then raw bytes both ways.
+//! UDP: one QUIC datagram per UDP packet. Client -> server: `u32 flow` + `u8 len` + service name +
+//! payload; server -> client: `u32 flow` + payload. A flow is one client-side source address.
 
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,13 +24,18 @@ use iroh::{
 use n0_future::StreamExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional, join},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::Mutex,
+    time::timeout,
 };
 
 pub use iroh::{EndpointId as PeerId, RelayUrl, SecretKey as Key};
 
 pub const ALPN: &[u8] = b"iroh-proxy/0";
+
+/// A UDP flow is dropped after this long idle (server: no reply from the target; client: nothing
+/// sent), like a NAT mapping. Short so per-query flows (DNS) don't pile up sockets.
+const UDP_IDLE: Duration = Duration::from_secs(30);
 
 /// Loads a 32-byte secret key from `path`, creating it (mode 0600) if missing.
 pub fn load_or_create_key(path: impl AsRef<Path>) -> Result<SecretKey> {
@@ -47,7 +58,9 @@ pub fn load_or_create_key(path: impl AsRef<Path>) -> Result<SecretKey> {
     }
 }
 
-/// `relay`: your own iroh-relay instead of n0's public ones. Set the same one on both ends.
+/// `relay`: your own iroh-relay instead of n0's public ones. Relayed traffic goes through the
+/// *dialed* endpoint's relay, so setting it on the server alone is enough; a client left on n0
+/// still gets QUIC address discovery from n0 for hole punching.
 async fn bind(key: SecretKey, relay: Option<RelayUrl>) -> Result<Endpoint> {
     let mut b = Endpoint::builder(presets::N0).secret_key(key);
     if let Some(url) = relay {
@@ -78,6 +91,7 @@ fn log_paths(conn: Connection) {
 #[derive(Debug, Clone)]
 struct Proxy {
     services: Arc<HashMap<String, String>>,
+    udp: Arc<HashMap<String, String>>,
     allowed: Arc<HashSet<EndpointId>>,
 }
 
@@ -91,6 +105,7 @@ impl ProtocolHandler for Proxy {
         }
         eprintln!("connected {}", peer.fmt_short());
         log_paths(conn.clone());
+        tokio::spawn(serve_datagrams(conn.clone(), self.udp.clone()));
         while let Ok((send, recv)) = conn.accept_bi().await {
             let services = self.services.clone();
             tokio::spawn(async move {
@@ -114,48 +129,112 @@ async fn serve_stream(services: &HashMap<String, String>, send: SendStream, mut 
     Ok(())
 }
 
-/// Starts serving `services` (name -> "host:port") to `allowed` peers. Drop/shutdown the Router to stop.
+type ServerFlows = Arc<std::sync::Mutex<HashMap<u32, Arc<UdpSocket>>>>;
+
+async fn serve_datagrams(conn: Connection, udp: Arc<HashMap<String, String>>) {
+    let peer = conn.remote_id().fmt_short();
+    let flows = ServerFlows::default();
+    while let Ok(d) = conn.read_datagram().await {
+        let Some((flow, rest)) = d.split_first_chunk::<4>() else { continue };
+        let flow = u32::from_be_bytes(*flow);
+        let Some((&len, rest)) = rest.split_first() else { continue };
+        let Some((name, payload)) = rest.split_at_checked(len as usize) else { continue };
+        let sock = flows.lock().unwrap().get(&flow).cloned();
+        let sock = match sock {
+            Some(s) => s,
+            None => match udp_flow(&conn, &udp, flow, name, flows.clone()).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{peer}: {e:#}");
+                    continue;
+                }
+            },
+        };
+        _ = sock.send(payload).await;
+    }
+}
+
+/// Opens a UDP socket to the service's target and relays its replies back as datagrams.
+async fn udp_flow(conn: &Connection, udp: &HashMap<String, String>, flow: u32, name: &[u8], flows: ServerFlows) -> Result<Arc<UdpSocket>> {
+    let name = String::from_utf8_lossy(name);
+    let Some(target) = udp.get(name.as_ref()) else { bail!("unknown udp service {name:?}") };
+    let addr = tokio::net::lookup_host(target).await?.next().with_context(|| format!("resolving {target}"))?;
+    let sock = UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).await?;
+    sock.connect(addr).await?;
+    let sock = Arc::new(sock);
+    flows.lock().unwrap().insert(flow, sock.clone());
+    let (conn, s, name) = (conn.clone(), sock.clone(), name.into_owned());
+    tokio::spawn(async move {
+        let mut buf = vec![0; 65535];
+        while let Ok(Ok(n)) = timeout(UDP_IDLE, s.recv(&mut buf)).await {
+            let d = [&flow.to_be_bytes(), &buf[..n]].concat();
+            if let Err(e) = conn.send_datagram(d.into()) {
+                if conn.close_reason().is_some() {
+                    break;
+                }
+                // Dropped like UDP over a small MTU; the max is ~1160 bytes over a relay.
+                eprintln!("{name}: dropped {n}-byte reply: {e}");
+            }
+        }
+        flows.lock().unwrap().remove(&flow);
+    });
+    Ok(sock)
+}
+
+/// Starts serving TCP `services` and `udp` services (name -> "host:port") to `allowed` peers.
+/// Drop/shutdown the Router to stop.
 pub async fn serve(
     key: SecretKey,
     relay: Option<RelayUrl>,
     services: HashMap<String, String>,
+    udp: HashMap<String, String>,
     allowed: HashSet<EndpointId>,
 ) -> Result<Router> {
-    let proxy = Proxy { services: Arc::new(services), allowed: Arc::new(allowed) };
+    let proxy = Proxy { services: Arc::new(services), udp: Arc::new(udp), allowed: Arc::new(allowed) };
     Ok(Router::builder(bind(key, relay).await?).accept(ALPN, proxy).spawn())
 }
 
 // ---------- client ----------
 
+type ClientFlows = Arc<std::sync::Mutex<HashMap<u32, (Arc<UdpSocket>, SocketAddr)>>>;
+
 pub struct Client {
     ep: Endpoint,
     server: EndpointId,
     conn: Mutex<Option<Connection>>,
+    udp: ClientFlows,
+    next_flow: AtomicU32,
 }
 
 impl Client {
     pub async fn new(key: SecretKey, server: EndpointId, relay: Option<RelayUrl>) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self { ep: bind(key, relay).await?, server, conn: Mutex::new(None) }))
+        let ep = bind(key, relay).await?;
+        Ok(Arc::new(Self { ep, server, conn: Mutex::new(None), udp: Default::default(), next_flow: AtomicU32::new(0) }))
     }
 
     pub fn id(&self) -> EndpointId {
         self.ep.id()
     }
 
-    /// Opens a stream, (re)connecting if the connection is gone (e.g. after laptop sleep).
-    // ponytail: one lock around open_bi serialises stream opens; fine for a handful of HTTP conns.
-    async fn open(&self) -> Result<(SendStream, RecvStream)> {
+    /// The live connection, (re)connecting if it is gone (e.g. after laptop sleep).
+    async fn conn(&self) -> Result<Connection> {
         let mut conn = self.conn.lock().await;
         if let Some(c) = conn.as_ref().filter(|c| c.close_reason().is_none()) {
-            if let Ok(s) = c.open_bi().await {
-                return Ok(s);
-            }
+            return Ok(c.clone());
         }
         let c = self.ep.connect(self.server, ALPN).await?;
-        let s = c.open_bi().await?;
         log_paths(c.clone());
-        *conn = Some(c);
-        Ok(s)
+        tokio::spawn(recv_datagrams(c.clone(), self.udp.clone()));
+        *conn = Some(c.clone());
+        Ok(c)
+    }
+
+    async fn open(&self) -> Result<(SendStream, RecvStream)> {
+        match self.conn().await?.open_bi().await {
+            Ok(s) => Ok(s),
+            // A failed open marks the connection closed, so this reconnects.
+            Err(_) => Ok(self.conn().await?.open_bi().await?),
+        }
     }
 
     /// Accepts TCP connections on `listener` forever, piping each to `service` on the server.
@@ -178,6 +257,52 @@ impl Client {
                     eprintln!("{service}: {e:#}");
                 }
             });
+        }
+    }
+
+    /// Relays UDP packets received on `sock` to the `service` UDP service on the server, and its
+    /// replies back to each sender.
+    pub async fn forward_udp(self: Arc<Self>, service: String, sock: UdpSocket) -> Result<()> {
+        if service.len() > u8::MAX as usize {
+            bail!("service name too long");
+        }
+        let sock = Arc::new(sock);
+        let mut ids = HashMap::new();
+        let mut buf = vec![0; 65535];
+        loop {
+            let (n, src) = sock.recv_from(&mut buf).await?;
+            let now = Instant::now();
+            if !ids.contains_key(&src) {
+                // Sweep idle flows whenever a new one starts (DNS uses a new source port per query).
+                ids.retain(|_, (id, seen): &mut (u32, Instant)| {
+                    let keep = now - *seen < UDP_IDLE;
+                    if !keep {
+                        self.udp.lock().unwrap().remove(id);
+                    }
+                    keep
+                });
+            }
+            let (flow, seen) = ids.entry(src).or_insert_with(|| {
+                let id = self.next_flow.fetch_add(1, Ordering::Relaxed);
+                self.udp.lock().unwrap().insert(id, (sock.clone(), src));
+                (id, now)
+            });
+            *seen = now;
+            let flow = *flow;
+            let d = [&flow.to_be_bytes(), &[service.len() as u8][..], service.as_bytes(), &buf[..n]].concat();
+            if let Err(e) = async { anyhow::Ok(self.conn().await?.send_datagram(d.into())?) }.await {
+                eprintln!("{service}: {e:#}");
+            }
+        }
+    }
+}
+
+async fn recv_datagrams(conn: Connection, flows: ClientFlows) {
+    while let Ok(d) = conn.read_datagram().await {
+        let Some((flow, payload)) = d.split_first_chunk::<4>() else { continue };
+        let dst = flows.lock().unwrap().get(&u32::from_be_bytes(*flow)).cloned();
+        if let Some((sock, src)) = dst {
+            _ = sock.send_to(payload, src).await;
         }
     }
 }
