@@ -5,14 +5,17 @@
 //! service, where port is the target's port (a suggested local port), then one
 //! `host <pattern> <name>\n` line per hostname a service answers for (see [`Service::hostnames`]),
 //! then `dns <name>\n` if a TCP service is offered as clients' DNS server (see [`Service::dns`]),
-//! then EOF.
+//! then `name <server name>\n` if the server has one, then EOF.
+//! Invites: a client that isn't allowed yet may open one bi-stream named `!invite <token>`; the
+//! server answers `ok` (and allows it from then on) or `invalid`, then closes the connection.
 //! UDP: one QUIC datagram per UDP packet. Client -> server: `u32 flow` + `u8 len` + service name +
 //! payload; server -> client: `u32 flow` + payload. A flow is one client-side source address.
 
 use std::{
     collections::{HashMap, HashSet},
+    io::Write as _,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -21,6 +24,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 pub use iroh::Endpoint;
 
 pub mod dns;
@@ -60,12 +64,8 @@ pub struct Service {
     pub dns: bool,
 }
 
-fn listing(
-    tcp: &HashMap<String, String>,
-    udp: &HashMap<String, String>,
-    hosts: &HashMap<String, Vec<String>>,
-    dns: Option<&str>,
-) -> String {
+fn listing(cfg: &ServerConfig) -> String {
+    let (tcp, udp, hosts, dns) = (&cfg.services, &cfg.udp_services, &cfg.hostnames, cfg.dns.as_deref());
     let port = |t: &String| t.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(0);
     let mut lines: Vec<String> = (tcp.iter().map(|(n, t)| format!("tcp {} {n}\n", port(t))))
         .chain(udp.iter().map(|(n, t)| format!("udp {} {n}\n", port(t))))
@@ -75,6 +75,7 @@ fn listing(
     host_lines.sort();
     lines.extend(host_lines);
     lines.extend(dns.map(|d| format!("dns {d}\n")));
+    lines.extend(cfg.name.as_ref().map(|n| format!("name {n}\n")));
     lines.concat()
 }
 
@@ -108,6 +109,11 @@ pub fn parse_services(s: &str) -> Vec<Service> {
         svc.dns = true;
     }
     services
+}
+
+/// The server's name from a listing, if it has one.
+pub fn parse_server_name(listing: &str) -> Option<String> {
+    listing.lines().find_map(|l| l.strip_prefix("name ")).map(str::to_owned)
 }
 
 /// The listing lines describing `svc`; the inverse of [`parse_services`].
@@ -176,35 +182,153 @@ fn log_paths(conn: Connection) {
 
 // ---------- server ----------
 
+/// What a server serves and to whom: `iroh-proxy serve`'s config file, minus key and relay.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct ServerConfig {
+    /// name -> "host:port" on the server's side.
+    #[serde(default)]
+    pub services: HashMap<String, String>,
+    #[serde(default)]
+    pub udp_services: HashMap<String, String>,
+    /// service name -> DNS names (exact, or "*.example.com") VPN-mode clients resolve to it.
+    #[serde(default)]
+    pub hostnames: HashMap<String, Vec<String>>,
+    /// A TCP service (e.g. AdGuard Home on port 53) VPN-mode clients use as their DNS server.
+    pub dns: Option<String>,
+    /// Client ids allowed to connect, besides those that redeemed an invite.
+    #[serde(default)]
+    pub allowed: HashSet<EndpointId>,
+    /// Shown to clients as this server's name.
+    pub name: Option<String>,
+    /// Where invites and the clients that redeemed them are kept (`invites`, `allowed`).
+    pub state_dir: Option<PathBuf>,
+}
+
+/// Creates a one-time invite for a client to be known as `label`; returns the token. Stored in
+/// `state_dir`, where a running server finds it.
+pub fn create_invite(state_dir: &Path, label: &str) -> Result<String> {
+    std::fs::create_dir_all(state_dir)?;
+    let token: String = rand::random::<[u8; 16]>().iter().map(|b| format!("{b:02x}")).collect();
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(state_dir.join("invites"))?;
+    writeln!(f, "{token} {}", label.trim())?;
+    Ok(token)
+}
+
+/// [`Client::redeem`]'s error when the server refused the invite (as opposed to being unreachable).
+#[derive(Debug)]
+pub struct InviteRejected;
+
+impl std::fmt::Display for InviteRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the server didn't accept this invite (already used, or not valid)")
+    }
+}
+
+impl std::error::Error for InviteRejected {}
+
+/// What a client pastes: the server's id and the token.
+pub fn invite_code(server: EndpointId, token: &str) -> String {
+    format!("{server}.{token}")
+}
+
+/// The server and token of an invite code found anywhere in `text` (e.g. a pasted message).
+pub fn parse_invite(text: &str) -> Option<(EndpointId, String)> {
+    let hex = |s: &str, n| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '.').find_map(|word| {
+        let (server, token) = word.split_once('.')?;
+        (hex(server, 64) && hex(token, 32)).then_some(())?;
+        Some((server.to_ascii_lowercase().parse().ok()?, token.to_ascii_lowercase()))
+    })
+}
+
+/// Removes `token` from the invites in `state_dir`; its label if it was there.
+fn take_invite(state_dir: &Path, token: &str) -> Result<Option<String>> {
+    let path = state_dir.join("invites");
+    let Ok(all) = std::fs::read_to_string(&path) else { return Ok(None) };
+    let (mine, rest): (Vec<&str>, Vec<&str>) = all.lines().partition(|l| l.split(' ').next() == Some(token));
+    let Some(line) = mine.first() else { return Ok(None) };
+    std::fs::write(&path, rest.iter().map(|l| format!("{l}\n")).collect::<String>())?;
+    Ok(Some(line.split_once(' ').map_or("", |(_, label)| label).to_owned()))
+}
+
+/// Who may connect: the config's `allowed`, plus `state_dir/allowed` (`<id> <label>` lines,
+/// re-read whenever an unknown client connects, so edits apply without a restart).
+#[derive(Debug)]
+struct Allowed {
+    fixed: HashSet<EndpointId>,
+    file: Option<PathBuf>,
+    invited: std::sync::Mutex<HashMap<EndpointId, String>>,
+}
+
+impl Allowed {
+    fn new(fixed: HashSet<EndpointId>, state_dir: Option<&Path>) -> Self {
+        let this = Self { fixed, file: state_dir.map(|d| d.join("allowed")), invited: Default::default() };
+        this.reload();
+        this
+    }
+
+    fn reload(&self) {
+        let Some(text) = self.file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()) else { return };
+        *self.invited.lock().unwrap() = text
+            .lines()
+            .filter_map(|l| {
+                let (id, label) = l.split_once(' ').unwrap_or((l, ""));
+                Some((id.trim().parse().ok()?, label.trim().to_owned()))
+            })
+            .collect();
+    }
+
+    /// The client's label ("" if it has none) if it may connect.
+    fn check(&self, id: &EndpointId) -> Option<String> {
+        if self.fixed.contains(id) {
+            return Some(String::new());
+        }
+        if let Some(label) = self.invited.lock().unwrap().get(id) {
+            return Some(label.clone());
+        }
+        self.reload();
+        self.invited.lock().unwrap().get(id).cloned()
+    }
+
+    fn add(&self, id: EndpointId, label: &str) -> Result<()> {
+        let file = self.file.as_ref().context("no state_dir")?;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+        writeln!(f, "{id} {label}")?;
+        self.invited.lock().unwrap().insert(id, label.to_owned());
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Proxy {
-    services: Arc<HashMap<String, String>>,
-    udp: Arc<HashMap<String, String>>,
-    hostnames: Arc<HashMap<String, Vec<String>>>,
-    dns: Option<Arc<str>>,
-    allowed: Arc<HashSet<EndpointId>>,
+    cfg: Arc<ServerConfig>,
+    allowed: Arc<Allowed>,
 }
+
+/// How long a client that isn't allowed gets to present an invite.
+const INVITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl ProtocolHandler for Proxy {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let peer = conn.remote_id();
-        if !self.allowed.contains(&peer) {
-            eprintln!("rejected {peer}");
-            conn.close(1u32.into(), b"not allowed");
+        let Some(label) = self.allowed.check(&peer) else {
+            self.guest(conn).await;
             return Ok(());
-        }
-        eprintln!("connected {}", peer.fmt_short());
+        };
+        let who = if label.is_empty() { peer.fmt_short().to_string() } else { format!("{label} ({})", peer.fmt_short()) };
+        eprintln!("connected {who}");
         log_paths(conn.clone());
-        tokio::spawn(serve_datagrams(conn.clone(), self.udp.clone()));
+        tokio::spawn(serve_datagrams(conn.clone(), Arc::new(self.cfg.udp_services.clone())));
         while let Ok((send, recv)) = conn.accept_bi().await {
             let this = self.clone();
+            let who = who.clone();
             tokio::spawn(async move {
                 if let Err(e) = this.serve_stream(send, recv).await {
-                    eprintln!("{peer}: {e:#}");
+                    eprintln!("{who}: {e:#}");
                 }
             });
         }
-        eprintln!("disconnected {peer}");
+        eprintln!("disconnected {who}");
         Ok(())
     }
 }
@@ -213,17 +337,62 @@ impl Proxy {
     async fn serve_stream(&self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
         let mut name = vec![0; recv.read_u8().await? as usize];
         if name.is_empty() {
-            send.write_all(listing(&self.services, &self.udp, &self.hostnames, self.dns.as_deref()).as_bytes()).await?;
+            send.write_all(listing(&self.cfg).as_bytes()).await?;
             send.finish()?;
             send.stopped().await?;
             return Ok(());
         }
         recv.read_exact(&mut name).await?;
         let name = String::from_utf8(name)?;
-        let Some(target) = self.services.get(&name) else { bail!("unknown service {name:?}") };
+        if name.starts_with("!invite ") {
+            // Already allowed: nothing to redeem.
+            send.write_all(b"ok").await?;
+            send.finish()?;
+            return Ok(());
+        }
+        let Some(target) = self.cfg.services.get(&name) else { bail!("unknown service {name:?}") };
         let mut tcp = TcpStream::connect(target).await.with_context(|| format!("{name} -> {target}"))?;
         copy_bidirectional(&mut join(recv, send), &mut tcp).await?;
         Ok(())
+    }
+
+    /// A client that isn't allowed: it may redeem an invite, and nothing else.
+    async fn guest(&self, conn: Connection) {
+        let peer = conn.remote_id();
+        let res = timeout(INVITE_TIMEOUT, async {
+            let (mut send, mut recv) = conn.accept_bi().await?;
+            let mut name = vec![0; recv.read_u8().await? as usize];
+            recv.read_exact(&mut name).await?;
+            let token = String::from_utf8_lossy(&name).strip_prefix("!invite ").map(str::to_owned);
+            if token.is_none() {
+                _ = send.reset(1u32.into()); // anything else is refused (dropping would finish cleanly)
+                return Ok((false, None));
+            }
+            let label = match (&token, &self.cfg.state_dir) {
+                (Some(t), Some(dir)) => take_invite(dir, t)?,
+                _ => None,
+            };
+            if let Some(label) = &label {
+                self.allowed.add(peer, label)?;
+            }
+            send.write_all(if label.is_some() { b"ok" } else { b"invalid" }).await?;
+            send.finish()?;
+            // Let the answer arrive before the connection closes, but don't wait on a client that
+            // has already gone (and whose close got lost).
+            _ = timeout(Duration::from_secs(2), send.stopped()).await;
+            anyhow::Ok((token.is_some(), label))
+        })
+        .await;
+        match res {
+            Ok(Ok((_, Some(label)))) => {
+                eprintln!("{peer} joined with an invite{}", if label.is_empty() { String::new() } else { format!(" as {label}") });
+                conn.close(0u32.into(), b"invited");
+                return;
+            }
+            Ok(Ok((true, None))) => eprintln!("rejected {peer}: invalid invite"),
+            _ => eprintln!("rejected {peer}"),
+        }
+        conn.close(1u32.into(), b"not allowed");
     }
 }
 
@@ -279,37 +448,21 @@ async fn udp_flow(conn: &Connection, udp: &HashMap<String, String>, flow: u32, n
     Ok(sock)
 }
 
-/// Starts serving TCP `services` and `udp` services (name -> "host:port") to `allowed` peers.
-/// `hostnames` (service name -> DNS names) is advertised to VPN-mode clients, as is `dns`, a TCP
-/// service to use as their DNS server.
-/// Drop/shutdown the Router to stop.
-pub async fn serve(
-    key: SecretKey,
-    relay: Option<RelayUrl>,
-    services: HashMap<String, String>,
-    udp: HashMap<String, String>,
-    hostnames: HashMap<String, Vec<String>>,
-    dns: Option<String>,
-    allowed: HashSet<EndpointId>,
-) -> Result<Router> {
-    if let Some(d) = dns.as_ref().filter(|d| !services.contains_key(*d)) {
+/// Starts serving `cfg` (see [`ServerConfig`]). Drop/shutdown the Router to stop.
+pub async fn serve(key: SecretKey, relay: Option<RelayUrl>, cfg: ServerConfig) -> Result<Router> {
+    if let Some(d) = cfg.dns.as_ref().filter(|d| !cfg.services.contains_key(*d)) {
         bail!("dns: no TCP service named {d:?}");
     }
-    for (name, hosts) in &hostnames {
-        if !services.contains_key(name) && !udp.contains_key(name) {
+    for (name, hosts) in &cfg.hostnames {
+        if !cfg.services.contains_key(name) && !cfg.udp_services.contains_key(name) {
             bail!("hostnames: no service named {name:?}");
         }
         if let Some(h) = hosts.iter().find(|h| h.is_empty() || h.contains(char::is_whitespace)) {
             bail!("hostnames: invalid name {h:?} for {name}");
         }
     }
-    let proxy = Proxy {
-        services: Arc::new(services),
-        udp: Arc::new(udp),
-        hostnames: Arc::new(hostnames),
-        dns: dns.map(Into::into),
-        allowed: Arc::new(allowed),
-    };
+    let allowed = Arc::new(Allowed::new(cfg.allowed.clone(), cfg.state_dir.as_deref()));
+    let proxy = Proxy { cfg: Arc::new(cfg), allowed };
     Ok(Router::builder(bind(key, relay).await?).accept(ALPN, proxy).spawn())
 }
 
@@ -414,11 +567,34 @@ impl Client {
 
     /// Asks the server which services it offers.
     pub async fn services(&self) -> Result<Vec<Service>> {
+        Ok(parse_services(&self.listing().await?))
+    }
+
+    /// The server's discovery listing (see the crate docs), e.g. for [`parse_server_name`].
+    pub async fn listing(&self) -> Result<String> {
         let (mut send, mut recv) = self.open().await?;
         send.write_u8(0).await?;
         send.finish()?;
         let list = recv.read_to_end(64 * 1024).await.context("listing services")?;
-        Ok(parse_services(&String::from_utf8_lossy(&list)))
+        Ok(String::from_utf8_lossy(&list).into_owned())
+    }
+
+    /// Redeems an invite token, after which the server allows this client.
+    pub async fn redeem(&self, token: &str) -> Result<()> {
+        let msg = format!("!invite {token}");
+        let (mut send, mut recv) = self.open().await?;
+        send.write_u8(msg.len() as u8).await?;
+        send.write_all(msg.as_bytes()).await?;
+        send.finish()?;
+        let reply = recv.read_to_end(64).await.context("redeeming invite")?;
+        // The server closes a guest's connection after redeeming; start afresh.
+        if let Some(c) = self.conn.lock().await.take() {
+            c.close(0u32.into(), b"invited");
+        }
+        if reply != b"ok" {
+            return Err(InviteRejected.into());
+        }
+        Ok(())
     }
 
     /// Listens on `addr` and forwards it to `svc` in the background; returns the bound address.

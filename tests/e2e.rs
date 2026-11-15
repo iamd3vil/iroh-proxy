@@ -1,7 +1,7 @@
 // Needs internet: peers find each other via n0 DNS/relays, like in real use.
 use std::{collections::HashMap, time::Duration};
 
-use iroh_proxy::{Client, Key, Service, serve};
+use iroh_proxy::{Client, Key, ServerConfig, Service, create_invite, serve};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -91,8 +91,15 @@ async fn allowed_peer_reaches_service_and_stranger_does_not() {
     let services = HashMap::from([("echo".to_string(), tcp_addr), ("dns".to_string(), dns_tcp_server().await)]);
     let udp = HashMap::from([("echo".to_string(), udp_addr)]);
     let hostnames = HashMap::from([("echo".to_string(), vec!["*.echo.test".to_string()])]);
-    let router =
-        serve(server_key.clone(), None, services, udp, hostnames, Some("dns".into()), [good.public()].into()).await.unwrap();
+    let cfg = ServerConfig {
+        services,
+        udp_services: udp,
+        hostnames,
+        dns: Some("dns".into()),
+        allowed: [good.public()].into(),
+        ..Default::default()
+    };
+    let router = serve(server_key.clone(), None, cfg).await.unwrap();
     router.endpoint().online().await;
 
     let ok = Client::new(good, server_key.public(), None).await.unwrap();
@@ -122,4 +129,36 @@ async fn allowed_peer_reaches_service_and_stranger_does_not() {
     assert!(stranger.services().await.is_err(), "non-allowlisted peer must not list services");
     assert!(roundtrip(stranger.clone(), "echo").await.is_err(), "non-allowlisted peer must be rejected");
     assert_eq!(udp_roundtrip(stranger, "echo").await, None, "non-allowlisted peer must not get udp");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invites_let_new_clients_in_once() {
+    let dir = std::env::temp_dir().join(format!("iroh-proxy-test-{}", std::process::id()));
+    let server_key = Key::generate();
+    let services = HashMap::from([("echo".to_string(), echo_server().await)]);
+    let cfg = ServerConfig { services, state_dir: Some(dir.clone()), name: Some("Home".into()), ..Default::default() };
+    let router = serve(server_key.clone(), None, cfg.clone()).await.unwrap();
+    router.endpoint().online().await;
+
+    let token = create_invite(&dir, "mom-phone").unwrap();
+    let (newcomer, other) = (Key::generate(), Key::generate());
+    let client = Client::new(newcomer.clone(), server_key.public(), None).await.unwrap();
+    assert!(client.services().await.is_err(), "not allowed before redeeming");
+    assert!(client.redeem("00000000000000000000000000000000").await.is_err(), "a wrong token is refused");
+    client.redeem(&token).await.unwrap();
+    assert_eq!(roundtrip(client.clone(), "echo").await.unwrap(), b"hello");
+    assert_eq!(iroh_proxy::parse_server_name(&client.listing().await.unwrap()).as_deref(), Some("Home"));
+
+    let second = Client::new(other, server_key.public(), None).await.unwrap();
+    assert!(second.redeem(&token).await.is_err(), "an invite works once");
+    assert!(second.services().await.is_err());
+
+    // Remembered across restarts (state_dir/allowed).
+    router.shutdown().await.unwrap();
+    let router = serve(server_key.clone(), None, cfg).await.unwrap();
+    router.endpoint().online().await;
+    let again = Client::new(newcomer, server_key.public(), None).await.unwrap();
+    assert!(again.services().await.is_ok());
+    assert!(std::fs::read_to_string(dir.join("allowed")).unwrap().contains("mom-phone"));
+    _ = std::fs::remove_dir_all(&dir);
 }

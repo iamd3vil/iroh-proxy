@@ -1,29 +1,34 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use iroh_proxy::{Client, PeerId, RelayUrl, Service, bind, dns, load_or_create_key};
+use iroh_proxy::{
+    Client, InviteRejected, PeerId, RelayUrl, ServerConfig, Service, bind, create_invite, dns, invite_code, load_or_create_key, parse_invite,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-struct ServerConfig {
+struct ServerFile {
     key_file: String,
     relay: Option<RelayUrl>,
-    /// Client endpoint ids allowed to connect.
-    allowed: HashSet<PeerId>,
-    /// name -> "host:port" on the homelab side.
-    #[serde(default)]
-    services: HashMap<String, String>,
-    #[serde(default)]
-    udp_services: HashMap<String, String>,
-    /// service name -> DNS names (e.g. "*.example.com") VPN-mode clients resolve to it.
-    #[serde(default)]
-    hostnames: HashMap<String, Vec<String>>,
-    /// A TCP service (e.g. AdGuard Home on port 53) VPN-mode clients use as their DNS server.
-    dns: Option<String>,
+    #[serde(flatten)]
+    cfg: ServerConfig,
+}
+
+impl ServerFile {
+    /// `state_dir` defaults to the key file's directory.
+    fn load(path: &str) -> Result<Self> {
+        let mut f: Self = load(path)?;
+        if f.cfg.state_dir.is_none() {
+            let dir = Path::new(&f.key_file).parent().unwrap_or(Path::new("."));
+            f.cfg.state_dir = Some(if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir.to_owned() });
+        }
+        Ok(f)
+    }
 }
 
 #[derive(Deserialize)]
@@ -165,15 +170,46 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match (args.get(1).map(String::as_str), args.get(2)) {
         (Some("serve"), Some(path)) => {
-            let cfg: ServerConfig = load(path)?;
-            let router = iroh_proxy::serve(load_or_create_key(&cfg.key_file)?, cfg.relay, cfg.services, cfg.udp_services, cfg.hostnames, cfg.dns, cfg.allowed).await?;
+            let f = ServerFile::load(path)?;
+            let router = iroh_proxy::serve(load_or_create_key(&f.key_file)?, f.relay, f.cfg).await?;
             println!("server id: {}", router.endpoint().id());
             tokio::signal::ctrl_c().await?;
             router.shutdown().await?;
         }
+        (Some("invite"), Some(path)) => {
+            let f = ServerFile::load(path)?;
+            let label = args.get(3).map_or("", String::as_str);
+            let token = create_invite(f.cfg.state_dir.as_deref().unwrap(), label)?;
+            let server = load_or_create_key(&f.key_file)?.public();
+            println!("{}", invite_code(server, &token));
+            eprintln!("One-time invite{}. Paste it into the app, or run `iroh-proxy join <client.toml> <invite>`.",
+                if label.is_empty() { String::new() } else { format!(" for {label}") });
+        }
+        (Some("join"), Some(path)) => {
+            let cfg: ClientConfig = load(path)?;
+            let (server, token) = args.get(3).and_then(|c| parse_invite(c)).context("usage: join <client.toml> <invite code>")?;
+            let client = Client::new(load_or_create_key(&cfg.key_file)?, server, cfg.relay).await?;
+            // A server that just started may not be findable yet; a refused invite is final.
+            let mut tries = 0;
+            while let Err(e) = client.redeem(&token).await {
+                tries += 1;
+                if tries == 4 || e.downcast_ref::<InviteRejected>().is_some() {
+                    return Err(e);
+                }
+                eprintln!("{e:#}; retrying");
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            println!("joined {server}");
+            if !cfg.server.iter().chain(&cfg.servers).any(|s| *s == server) {
+                eprintln!("Add it to `servers` in {path} to connect to it.");
+            }
+        }
         (Some("connect"), Some(path)) => connect(load(path)?).await?,
         (Some("id"), Some(key_file)) => println!("{}", load_or_create_key(key_file)?.public()),
-        _ => eprintln!("usage: iroh-proxy serve <server.toml> | connect <client.toml> | id <key_file>"),
+        _ => eprintln!(
+            "usage: iroh-proxy serve <server.toml> | invite <server.toml> [label] | connect <client.toml> \
+             | join <client.toml> <invite> | id <key_file>"
+        ),
     }
     Ok(())
 }
