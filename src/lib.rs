@@ -2,7 +2,9 @@
 //!
 //! TCP: per QUIC bi-stream, `u8 len` + service name, then raw bytes both ways.
 //! Discovery: a bi-stream with an empty name gets back one `tcp|udp <port> <name>\n` line per
-//! service, where port is the target's port (a suggested local port), then EOF.
+//! service, where port is the target's port (a suggested local port), then one
+//! `host <pattern> <name>\n` line per hostname a service answers for (see [`Service::hostnames`]),
+//! then EOF.
 //! UDP: one QUIC datagram per UDP packet. Client -> server: `u32 flow` + `u8 len` + service name +
 //! payload; server -> client: `u32 flow` + payload. A flow is one client-side source address.
 
@@ -46,30 +48,55 @@ pub struct Service {
     pub udp: bool,
     /// The target's port on the server side; used as the default local port.
     pub port: u16,
+    /// DNS names (exact, or `*.example.com` for any subdomain) that VPN-mode clients resolve to
+    /// this service, so it is reachable by its usual name on [`Service::port`].
+    pub hostnames: Vec<String>,
 }
 
-fn listing(tcp: &HashMap<String, String>, udp: &HashMap<String, String>) -> String {
+fn listing(tcp: &HashMap<String, String>, udp: &HashMap<String, String>, hosts: &HashMap<String, Vec<String>>) -> String {
     let port = |t: &String| t.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(0);
     let mut lines: Vec<String> = (tcp.iter().map(|(n, t)| format!("tcp {} {n}\n", port(t))))
         .chain(udp.iter().map(|(n, t)| format!("udp {} {n}\n", port(t))))
         .collect();
     lines.sort();
+    let mut host_lines: Vec<String> = hosts.iter().flat_map(|(n, hs)| hs.iter().map(move |h| format!("host {h} {n}\n"))).collect();
+    host_lines.sort();
+    lines.extend(host_lines);
     lines.concat()
 }
 
-/// Parses `tcp|udp <port> <name>` lines (the discovery listing format); skips malformed lines.
+/// Parses the discovery listing format (see the crate docs); skips malformed lines.
 pub fn parse_services(s: &str) -> Vec<Service> {
-    s.lines()
-        .filter_map(|l| {
-            let mut it = l.splitn(3, ' ');
-            let udp = match it.next()? {
-                "tcp" => false,
-                "udp" => true,
-                _ => return None,
-            };
-            Some(Service { udp, port: it.next()?.parse().ok()?, name: it.next()?.to_owned() })
-        })
-        .collect()
+    let mut services = Vec::new();
+    let mut hosts = Vec::new();
+    for l in s.lines() {
+        let mut it = l.splitn(3, ' ');
+        let (Some(kind), Some(arg), Some(name)) = (it.next(), it.next(), it.next()) else { continue };
+        match kind {
+            "tcp" | "udp" => {
+                let Ok(port) = arg.parse() else { continue };
+                services.push(Service { name: name.to_owned(), udp: kind == "udp", port, hostnames: vec![] });
+            }
+            "host" => hosts.push((arg.to_owned(), name)),
+            _ => {}
+        }
+    }
+    for (host, name) in hosts {
+        for svc in services.iter_mut().filter(|s| s.name == name) {
+            svc.hostnames.push(host.clone());
+        }
+    }
+    services
+}
+
+/// The listing lines describing `svc`; the inverse of [`parse_services`].
+pub fn service_lines(svc: &Service) -> String {
+    let proto = if svc.udp { "udp" } else { "tcp" };
+    let mut out = format!("{proto} {} {}\n", svc.port, svc.name);
+    for h in &svc.hostnames {
+        out += &format!("host {h} {}\n", svc.name);
+    }
+    out
 }
 
 /// Loads a 32-byte secret key from `path`, creating it (mode 0600) if missing.
@@ -127,6 +154,7 @@ fn log_paths(conn: Connection) {
 struct Proxy {
     services: Arc<HashMap<String, String>>,
     udp: Arc<HashMap<String, String>>,
+    hostnames: Arc<HashMap<String, Vec<String>>>,
     allowed: Arc<HashSet<EndpointId>>,
 }
 
@@ -158,7 +186,7 @@ impl Proxy {
     async fn serve_stream(&self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
         let mut name = vec![0; recv.read_u8().await? as usize];
         if name.is_empty() {
-            send.write_all(listing(&self.services, &self.udp).as_bytes()).await?;
+            send.write_all(listing(&self.services, &self.udp, &self.hostnames).as_bytes()).await?;
             send.finish()?;
             send.stopped().await?;
             return Ok(());
@@ -225,15 +253,30 @@ async fn udp_flow(conn: &Connection, udp: &HashMap<String, String>, flow: u32, n
 }
 
 /// Starts serving TCP `services` and `udp` services (name -> "host:port") to `allowed` peers.
+/// `hostnames` (service name -> DNS names) is advertised to VPN-mode clients.
 /// Drop/shutdown the Router to stop.
 pub async fn serve(
     key: SecretKey,
     relay: Option<RelayUrl>,
     services: HashMap<String, String>,
     udp: HashMap<String, String>,
+    hostnames: HashMap<String, Vec<String>>,
     allowed: HashSet<EndpointId>,
 ) -> Result<Router> {
-    let proxy = Proxy { services: Arc::new(services), udp: Arc::new(udp), allowed: Arc::new(allowed) };
+    for (name, hosts) in &hostnames {
+        if !services.contains_key(name) && !udp.contains_key(name) {
+            bail!("hostnames: no service named {name:?}");
+        }
+        if let Some(h) = hosts.iter().find(|h| h.is_empty() || h.contains(char::is_whitespace)) {
+            bail!("hostnames: invalid name {h:?} for {name}");
+        }
+    }
+    let proxy = Proxy {
+        services: Arc::new(services),
+        udp: Arc::new(udp),
+        hostnames: Arc::new(hostnames),
+        allowed: Arc::new(allowed),
+    };
     Ok(Router::builder(bind(key, relay).await?).accept(ALPN, proxy).spawn())
 }
 
@@ -278,6 +321,17 @@ impl Client {
             // A failed open marks the connection closed, so this reconnects.
             Err(_) => Ok(self.conn().await?.open_bi().await?),
         }
+    }
+
+    /// Opens a stream to the TCP `service` on the server.
+    pub async fn connect(&self, service: &str) -> Result<(SendStream, RecvStream)> {
+        if service.len() > u8::MAX as usize {
+            bail!("service name too long");
+        }
+        let (mut send, recv) = self.open().await?;
+        send.write_u8(service.len() as u8).await?;
+        send.write_all(service.as_bytes()).await?;
+        Ok((send, recv))
     }
 
     /// Asks the server which services it offers.
@@ -333,9 +387,7 @@ impl Client {
             let (this, service) = (self.clone(), service.clone());
             tokio::spawn(async move {
                 let res = async {
-                    let (mut send, recv) = this.open().await?;
-                    send.write_u8(service.len() as u8).await?;
-                    send.write_all(service.as_bytes()).await?;
+                    let (send, recv) = this.connect(&service).await?;
                     copy_bidirectional(&mut tcp, &mut join(recv, send)).await?;
                     anyhow::Ok(())
                 };

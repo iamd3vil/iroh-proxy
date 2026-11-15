@@ -71,7 +71,8 @@ async fn allowed_peer_reaches_service_and_stranger_does_not() {
     let (tcp_port, udp_port) = (port(&tcp_addr), port(&udp_addr));
     let services = HashMap::from([("echo".to_string(), tcp_addr)]);
     let udp = HashMap::from([("echo".to_string(), udp_addr)]);
-    let router = serve(server_key.clone(), None, services, udp, [good.public()].into()).await.unwrap();
+    let hostnames = HashMap::from([("echo".to_string(), vec!["*.echo.test".to_string()])]);
+    let router = serve(server_key.clone(), None, services, udp, hostnames, [good.public()].into()).await.unwrap();
     router.endpoint().online().await;
 
     let ok = Client::new(good, server_key.public(), None).await.unwrap();
@@ -81,8 +82,8 @@ async fn allowed_peer_reaches_service_and_stranger_does_not() {
 
     let found = ok.services().await.unwrap();
     assert_eq!(found, [
-        Service { name: "echo".into(), udp: false, port: tcp_port },
-        Service { name: "echo".into(), udp: true, port: udp_port },
+        Service { name: "echo".into(), udp: false, port: tcp_port, hostnames: vec!["*.echo.test".into()] },
+        Service { name: "echo".into(), udp: true, port: udp_port, hostnames: vec!["*.echo.test".into()] },
     ]);
     // The echo server already holds its own port, so expose must fall back to a random one.
     let local = ok.expose(&found[0], None).await.unwrap();
