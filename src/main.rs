@@ -1,7 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
-use anyhow::{Context, Result};
-use iroh_proxy::{Client, PeerId, RelayUrl, Service, load_or_create_key};
+use anyhow::{Context, Result, bail};
+use iroh_proxy::{Client, PeerId, RelayUrl, Service, bind, dns, load_or_create_key};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -26,13 +30,129 @@ struct ServerConfig {
 struct ClientConfig {
     key_file: String,
     relay: Option<RelayUrl>,
-    server: PeerId,
-    /// Every service the server offers is forwarded on 127.0.0.1:<its port> (or a random port if
+    /// The server to connect to; or several, with `servers`. All see the same client id.
+    server: Option<PeerId>,
+    #[serde(default)]
+    servers: Vec<PeerId>,
+    /// Every service the servers offer is forwarded on 127.0.0.1:<its port> (or a random port if
     /// that is taken). These override the local "host:port" per service name.
     #[serde(default)]
     forwards: HashMap<String, String>,
     #[serde(default)]
     udp_forwards: HashMap<String, String>,
+    /// Run a DNS server here (e.g. "127.0.0.1:53") answering the services' hostnames with their
+    /// local forward's address, and everything else via a server's DNS service (if one is
+    /// offered) or `upstream_dns`.
+    dns: Option<SocketAddr>,
+    /// Resolvers for names the servers don't handle ("ip" or "ip:port"); default: the system's,
+    /// from /etc/resolv.conf (minus `dns` itself).
+    upstream_dns: Option<Vec<String>>,
+}
+
+/// How long to wait for each server's service list.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+async fn connect(cfg: ClientConfig) -> Result<()> {
+    let mut servers: Vec<PeerId> = cfg.server.into_iter().chain(cfg.servers).collect();
+    let mut seen = HashSet::new();
+    servers.retain(|s| seen.insert(*s));
+    if servers.is_empty() {
+        bail!("no `server` or `servers` in the config");
+    }
+    let ep = bind(load_or_create_key(&cfg.key_file)?, cfg.relay).await?;
+    println!("client id: {} (add to each server's `allowed`)", ep.id());
+    let clients: Vec<_> = servers.iter().map(|s| Client::with_endpoint(ep.clone(), *s)).collect();
+
+    // Discover all servers at once; a slow or offline one shouldn't hold up the rest.
+    let mut found = vec![vec![]; clients.len()];
+    let mut asks = tokio::task::JoinSet::new();
+    for (i, c) in clients.iter().enumerate() {
+        let c = c.clone();
+        asks.spawn(async move { (i, tokio::time::timeout(DISCOVERY_TIMEOUT, c.services()).await) });
+    }
+    while let Some(Ok((i, res))) = asks.join_next().await {
+        match res {
+            Ok(Ok(list)) => found[i] = list,
+            Ok(Err(e)) => eprintln!("{}: service discovery failed ({e:#})", servers[i].fmt_short()),
+            Err(_) => eprintln!("{}: service discovery timed out", servers[i].fmt_short()),
+        }
+    }
+    // Configured forwards nobody advertised (e.g. an older server) go to the first server.
+    let configured = (cfg.forwards.keys().map(|n| (n, false))).chain(cfg.udp_forwards.keys().map(|n| (n, true)));
+    for (name, udp) in configured {
+        if !found.iter().flatten().any(|s| s.name == *name && s.udp == udp) {
+            found[0].push(Service { name: name.clone(), udp, port: 0, hostnames: vec![], dns: false });
+        }
+    }
+
+    let mut names = dns::Names::default();
+    let mut tunnel = None;
+    for (client, services) in clients.iter().zip(&found) {
+        let from = if clients.len() > 1 { format!(" on {}", client.server().fmt_short()) } else { String::new() };
+        for svc in services {
+            if svc.dns {
+                if tunnel.is_none() {
+                    println!("dns -> {}{from}", svc.name);
+                    tunnel = Some((client.clone(), svc.name.clone()));
+                }
+                continue;
+            }
+            let addr = if svc.udp { &cfg.udp_forwards } else { &cfg.forwards }.get(&svc.name);
+            let proto = if svc.udp { "udp" } else { "tcp" };
+            let local = match client.expose(svc, addr.map(String::as_str)).await {
+                Ok(local) => local,
+                Err(e) => {
+                    eprintln!("{proto} {}{from}: {e:#}", svc.name);
+                    continue;
+                }
+            };
+            println!("{proto} {local} -> {}{from}", svc.name);
+            if svc.udp || svc.hostnames.is_empty() {
+                continue;
+            }
+            let ip = match local.ip() {
+                IpAddr::V4(ip) if !ip.is_unspecified() => ip,
+                _ => Ipv4Addr::LOCALHOST,
+            };
+            for h in &svc.hostnames {
+                names.insert(h, ip);
+            }
+            if cfg.dns.is_some() && local.port() != svc.port {
+                eprintln!(
+                    "  dns answers {} with {ip}, but {} is on port {} there, not {}; set forwards.{} = \"{ip}:{}\" \
+                     (ports below 1024 need root)",
+                    svc.hostnames.join(", "),
+                    svc.name,
+                    local.port(),
+                    svc.port,
+                    svc.name,
+                    svc.port,
+                );
+            }
+        }
+    }
+
+    if let Some(addr) = cfg.dns {
+        let upstream: Vec<SocketAddr> = match &cfg.upstream_dns {
+            Some(list) => list
+                .iter()
+                .map(|s| s.parse().or_else(|_| s.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53))))
+                .collect::<Result<_, _>>()
+                .context("upstream_dns")?,
+            None => dns::system_upstream(addr),
+        };
+        if upstream.is_empty() {
+            eprintln!("dns: no upstream resolvers; set upstream_dns (e.g. your router) for names the servers don't handle");
+        }
+        println!("dns {addr}: hostnames locally, then {}", if tunnel.is_some() { "the server's DNS" } else { "upstream" });
+        tokio::spawn(async move {
+            if let Err(e) = dns::serve(addr, names, tunnel, upstream).await {
+                eprintln!("dns: {e:#}");
+            }
+        });
+    }
+    tokio::signal::ctrl_c().await?;
+    Ok(())
 }
 
 fn load<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
@@ -51,31 +171,7 @@ async fn main() -> Result<()> {
             tokio::signal::ctrl_c().await?;
             router.shutdown().await?;
         }
-        (Some("connect"), Some(path)) => {
-            let cfg: ClientConfig = load(path)?;
-            let client = Client::new(load_or_create_key(&cfg.key_file)?, cfg.server, cfg.relay).await?;
-            println!("client id: {} (add to server's `allowed`)", client.id());
-            let mut services = client.services().await.unwrap_or_else(|e| {
-                eprintln!("service discovery failed ({e:#}); forwarding configured services only");
-                vec![]
-            });
-            // Configured forwards the server didn't advertise (e.g. an older server) still count.
-            let configured = (cfg.forwards.keys().map(|n| (n, false))).chain(cfg.udp_forwards.keys().map(|n| (n, true)));
-            for (name, udp) in configured {
-                if !services.iter().any(|s| s.name == *name && s.udp == udp) {
-                    services.push(Service { name: name.clone(), udp, port: 0, hostnames: vec![], dns: false });
-                }
-            }
-            for svc in &services {
-                let addr = if svc.udp { &cfg.udp_forwards } else { &cfg.forwards }.get(&svc.name);
-                let proto = if svc.udp { "udp" } else { "tcp" };
-                match client.expose(svc, addr.map(String::as_str)).await {
-                    Ok(local) => println!("{proto} {local} -> {}", svc.name),
-                    Err(e) => eprintln!("{proto} {}: {e:#}", svc.name),
-                }
-            }
-            tokio::signal::ctrl_c().await?;
-        }
+        (Some("connect"), Some(path)) => connect(load(path)?).await?,
         (Some("id"), Some(key_file)) => println!("{}", load_or_create_key(key_file)?.public()),
         _ => eprintln!("usage: iroh-proxy serve <server.toml> | connect <client.toml> | id <key_file>"),
     }

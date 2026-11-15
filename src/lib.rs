@@ -22,6 +22,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 pub use iroh::Endpoint;
+
+pub mod dns;
 use iroh::{
     EndpointId, RelayMode, SecretKey, TransportAddr,
     endpoint::{Connection, RecvStream, SendStream, presets},

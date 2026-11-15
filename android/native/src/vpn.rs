@@ -17,7 +17,10 @@ use std::{
 };
 
 use anyhow::Result;
-use iroh_proxy::{Client, Service};
+use iroh_proxy::{
+    Client, Service,
+    dns::{self, Names},
+};
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
     phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken},
@@ -29,12 +32,11 @@ use smoltcp::{
 };
 use tokio::{
     io::unix::AsyncFd,
-    net::UdpSocket,
     sync::{
         Notify,
         mpsc::{self, error::TryRecvError, error::TrySendError},
     },
-    time::{sleep, timeout},
+    time::sleep,
 };
 
 /// The VPN's address range; the Android side routes exactly this.
@@ -46,10 +48,6 @@ pub const DNS_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 /// Virtual IPs for hostname patterns count up from here.
 const FIRST_VIP: Ipv4Addr = Ipv4Addr::new(198, 18, 1, 1);
 pub const MTU: usize = 1500;
-/// Short, so stale answers don't outlive the VPN for long.
-const DNS_TTL: u32 = 30;
-/// How long to wait for the tunnel DNS before falling back to the network's.
-const TUNNEL_DNS_TIMEOUT: Duration = Duration::from_secs(4);
 const TCP_BUF: usize = 128 * 1024;
 /// A listening socket whose handshake never completed is dropped after this.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,7 +66,7 @@ pub fn set_upstream(mut servers: Vec<SocketAddr>) {
 /// Which names resolve to which virtual IP, and which service (a `T`, e.g. the server's client,
 /// plus the service name) each `virtual IP:port` reaches.
 pub struct Table<T> {
-    names: Vec<(String, Ipv4Addr)>,
+    names: Names,
     ports: HashMap<SocketAddrV4, (T, String)>,
 }
 
@@ -77,15 +75,17 @@ impl<T: Clone> Table<T> {
     /// servers) claim the same name and port, the first one listed wins.
     pub fn new(services: &[(T, Service)]) -> Self {
         let tcp = || services.iter().filter(|(_, s)| !s.udp);
-        let mut patterns: Vec<String> = tcp().flat_map(|(_, s)| s.hostnames.iter().map(|h| normalize(h))).collect();
+        let mut patterns: Vec<String> = tcp().flat_map(|(_, s)| s.hostnames.iter().map(|h| h.trim_end_matches('.').to_ascii_lowercase())).collect();
         patterns.sort();
         patterns.dedup();
-        let names: Vec<(String, Ipv4Addr)> =
-            patterns.into_iter().enumerate().map(|(i, p)| (p, Ipv4Addr::from(u32::from(FIRST_VIP) + i as u32))).collect();
+        let mut names = Names::default();
+        for (i, p) in patterns.iter().enumerate() {
+            names.insert(p, Ipv4Addr::from(u32::from(FIRST_VIP) + i as u32));
+        }
         let mut ports = HashMap::new();
         for (target, svc) in tcp() {
             for h in &svc.hostnames {
-                let vip = names.iter().find(|(p, _)| *p == normalize(h)).unwrap().1;
+                let vip = names.get(h).unwrap();
                 ports.entry(SocketAddrV4::new(vip, svc.port)).or_insert_with(|| (target.clone(), svc.name.clone()));
             }
         }
@@ -96,164 +96,32 @@ impl<T: Clone> Table<T> {
         self.names.is_empty()
     }
 
-    /// The virtual IP for `name`: an exact pattern wins, then the longest matching wildcard.
+    #[cfg(test)]
     fn resolve(&self, name: &str) -> Option<Ipv4Addr> {
-        let name = normalize(name);
-        self.names.iter().filter_map(|(p, ip)| score(p, &name).map(|s| (s, *ip))).max_by_key(|(s, _)| *s).map(|(_, ip)| ip)
+        self.names.resolve(name)
     }
 }
 
-fn normalize(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
-}
-
-/// How well `pattern` (`name` or `*.suffix`) matches `name`; both normalized.
-fn score(pattern: &str, name: &str) -> Option<usize> {
-    match pattern.strip_prefix("*.") {
-        Some(suffix) => (name.len() > suffix.len() + 1 && name.ends_with(suffix) && name[..name.len() - suffix.len()].ends_with('.'))
-            .then_some(suffix.len()),
-        None => (pattern == name).then_some(usize::MAX),
-    }
-}
-
-// ---------- DNS ----------
-
-struct Question {
-    name: String,
-    qtype: u16,
-    /// Where the question ends (header + question section).
-    end: usize,
-}
-
-/// The single question of a standard query, if `msg` is one.
-fn parse_query(msg: &[u8]) -> Option<Question> {
-    let flags = u16::from_be_bytes([*msg.get(2)?, *msg.get(3)?]);
-    let qdcount = u16::from_be_bytes([*msg.get(4)?, *msg.get(5)?]);
-    if flags & 0x8000 != 0 || (flags >> 11) & 0xf != 0 || qdcount != 1 {
-        return None; // a response, a non-standard opcode, or several questions
-    }
-    let mut labels = Vec::new();
-    let mut i = 12;
-    loop {
-        let len = *msg.get(i)? as usize;
-        i += 1;
-        if len == 0 {
-            break;
-        }
-        if len > 63 {
-            return None; // compression pointers don't occur in queries
-        }
-        labels.push(std::str::from_utf8(msg.get(i..i + len)?).ok()?);
-        i += len;
-    }
-    let qtype = u16::from_be_bytes([*msg.get(i)?, *msg.get(i + 1)?]);
-    Some(Question { name: labels.join("."), qtype, end: i + 4 }).filter(|q| q.end <= msg.len())
-}
-
-/// An authoritative answer to `query`: an A record for `ip`, or no records for other types (so
-/// AAAA lookups fall back to the A record).
-fn answer(query: &[u8], q: &Question, ip: Ipv4Addr) -> Vec<u8> {
-    let a = q.qtype == 1;
-    let mut r = query[..q.end].to_vec(); // header + question; drops any EDNS record
-    r[2] = 0x84 | (query[2] & 0x01); // response, authoritative, keep RD
-    r[3] = 0x80; // recursion available, NOERROR
-    r[4..12].copy_from_slice(&[0, 1, 0, a as u8, 0, 0, 0, 0]);
-    if a {
-        r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]); // name -> the question's, type A, class IN
-        r.extend_from_slice(&DNS_TTL.to_be_bytes());
-        r.extend_from_slice(&[0, 4]);
-        r.extend_from_slice(&ip.octets());
-    }
-    r
-}
-
-/// SERVFAIL for `query` (header only).
-fn servfail(query: &[u8]) -> Vec<u8> {
-    let mut r = query[..12.min(query.len())].to_vec();
-    r.resize(12, 0);
-    r[2] = 0x80 | (r[2] & 0x01);
-    r[3] = 0x82;
-    r[4..12].fill(0);
-    r
-}
-
-/// A server's DNS service, used for every name the VPN doesn't answer itself.
-pub type TunnelDns = (Arc<Client>, String);
-
-/// Resolves `query` for `client` and queues the reply: through the tunnel DNS if there is one,
-/// else (or if it fails) via the network's resolvers.
-async fn forward_dns(
+/// Answers `query` from `client` (names locally, the rest via [`dns::forward`]) and queues the
+/// reply, truncated if it wouldn't fit the TUN's MTU.
+async fn answer_dns(
     query: Vec<u8>,
     client: SocketAddrV4,
+    names: Arc<Names>,
     tunnel: Option<TunnelDns>,
     replies: mpsc::Sender<(SocketAddrV4, Vec<u8>)>,
 ) {
-    if let Some((server, service)) = tunnel {
-        match timeout(TUNNEL_DNS_TIMEOUT, server.dns_query(&service, &query)).await {
-            Ok(Ok(reply)) => {
-                _ = replies.send((client, reply)).await;
-                return;
-            }
-            Ok(Err(e)) => crate::log(&format!("dns via {service}: {e:#}; using the network's")),
-            Err(_) => crate::log(&format!("dns via {service}: timed out; using the network's")),
-        }
-    }
-    let reply = network_dns(&query).await;
+    let upstream = UPSTREAM.lock().unwrap().clone();
+    let Some(reply) = dns::resolve(&query, &names, tunnel.as_ref(), &upstream, |w| crate::log(&w)).await else { return };
+    let reply = if 20 + 8 + reply.len() > MTU { dns::truncated(&reply) } else { reply };
     _ = replies.send((client, reply)).await;
 }
 
-/// Asks all of the real network's resolvers at once and returns the first reply (some listed
-/// servers, e.g. IPv6 ones, may not answer at all), or SERVFAIL.
-async fn network_dns(query: &[u8]) -> Vec<u8> {
-    let upstream = UPSTREAM.lock().unwrap().clone();
-    let query: Arc<[u8]> = query.into();
-    let mut asks = tokio::task::JoinSet::new();
-    for server in upstream {
-        let query = query.clone();
-        asks.spawn(async move {
-            let sock = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).await?;
-            sock.connect(server).await?;
-            sock.send(&query).await?;
-            let mut buf = vec![0; 4096];
-            loop {
-                let n = sock.recv(&mut buf).await?;
-                if n >= 2 && buf[..2] == query[..2] {
-                    buf.truncate(n);
-                    return io::Result::Ok(buf); // matching id
-                }
-            }
-        });
-    }
-    let first = timeout(Duration::from_secs(4), async {
-        while let Some(r) = asks.join_next().await {
-            if let Ok(Ok(reply)) = r {
-                return Some(reply);
-            }
-        }
-        None
-    });
-    match first.await {
-        Ok(Some(reply)) => reply,
-        _ => {
-            crate::log(&format!("dns: no answer from {:?}", *UPSTREAM.lock().unwrap()));
-            servfail(&query)
-        }
-    }
-}
+/// A server's DNS service, used for every name the VPN doesn't answer itself.
+pub type TunnelDns = dns::Tunnel;
 
-/// An IPv4/UDP packet from `src` to `dst`. Replies too big for the MTU are truncated (TC bit),
-/// as a DNS server would over UDP.
+/// An IPv4/UDP packet from `src` to `dst`.
 fn udp_packet(src: SocketAddrV4, dst: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
-    let truncated;
-    let payload = if 20 + 8 + payload.len() > MTU && payload.len() >= 12 {
-        let mut t = servfail(payload);
-        t[3] = payload[3];
-        t[2] = payload[2] | 0x02;
-        truncated = t;
-        &truncated[..]
-    } else {
-        payload
-    };
     let caps = ChecksumCapabilities::default();
     let ip = Ipv4Repr {
         src_addr: *src.ip(),
@@ -368,6 +236,7 @@ pub async fn run(fd: OwnedFd, table: Table<Arc<Client>>, tunnel_dns: Option<Tunn
     let (dns_tx, mut dns_rx) = mpsc::channel::<(SocketAddrV4, Vec<u8>)>(64);
     let mut buf = vec![0u8; 65536];
     let mut incoming = Vec::new();
+    let names = Arc::new(table.names.clone());
 
     loop {
         for p in dev.tx.drain(..) {
@@ -399,14 +268,7 @@ pub async fn run(fd: OwnedFd, table: Table<Arc<Client>>, tunnel_dns: Option<Tunn
                         continue;
                     }
                     let client_addr = SocketAddrV4::new(src_ip, udp.src_port());
-                    let query = udp.payload();
-                    match parse_query(query).and_then(|q| Some((table.resolve(&q.name)?, q))) {
-                        Some((vip, q)) => write(&udp_packet(SocketAddrV4::new(DNS_IP, 53), client_addr, &answer(query, &q, vip))),
-                        None if query.len() >= 12 => {
-                            tokio::spawn(forward_dns(query.to_vec(), client_addr, tunnel_dns.clone(), dns_tx.clone()));
-                        }
-                        None => {}
-                    }
+                    tokio::spawn(answer_dns(udp.payload().to_vec(), client_addr, names.clone(), tunnel_dns.clone(), dns_tx.clone()));
                     continue;
                 }
                 IpProtocol::Tcp => {
@@ -573,27 +435,5 @@ mod tests {
         assert_eq!(t.ports[&SocketAddrV4::new(wild, 80)], (1, "proxy-http".into()));
         assert_eq!(t.ports[&SocketAddrV4::new(t.resolve("jf.example.com").unwrap(), 8096)], (2, "jf".into()));
         assert!(!t.ports.contains_key(&SocketAddrV4::new(wild, 22)));
-    }
-
-    #[test]
-    fn answers_a_and_empties_aaaa() {
-        // id 0x1234, RD, one question: jelly.example.com A IN
-        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
-        for l in ["jelly", "example", "com"] {
-            q.push(l.len() as u8);
-            q.extend_from_slice(l.as_bytes());
-        }
-        q.extend_from_slice(&[0, 0, 1, 0, 1]);
-        let parsed = parse_query(&q).unwrap();
-        assert_eq!((parsed.name.as_str(), parsed.qtype), ("jelly.example.com", 1));
-        let r = answer(&q, &parsed, Ipv4Addr::new(198, 18, 1, 1));
-        assert_eq!(&r[..4], &[0x12, 0x34, 0x85, 0x80]);
-        assert_eq!(&r[6..8], &[0, 1]);
-        assert_eq!(&r[r.len() - 4..], &[198, 18, 1, 1]);
-
-        let n = q.len();
-        q[n - 3] = 28; // AAAA
-        let r = answer(&q, &parse_query(&q).unwrap(), Ipv4Addr::new(198, 18, 1, 1));
-        assert_eq!((&r[6..8], r.len()), (&[0u8, 0][..], q.len()));
     }
 }
