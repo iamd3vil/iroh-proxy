@@ -28,7 +28,7 @@ class ProxyService : VpnService() {
     /** Observed by the UI. Only written on the main thread. */
     object State {
         var running by mutableStateOf(false)
-        /** Service key ("tcp name") -> local address, or null if it could not be bound. */
+        /** [Svc.key] -> local address, or null if it could not be bound. */
         var forwards by mutableStateOf<Map<String, String?>>(emptyMap())
         var error by mutableStateOf<String?>(null)
         var vpn by mutableStateOf(false)
@@ -49,17 +49,17 @@ class ProxyService : VpnService() {
         startForeground(notification("Connecting…"))
         State.error = null
         val prefs = Prefs(this)
-        val vpn = Svc.parse(spec).any { it.needsVpn }
+        val vpn = intent.getBooleanExtra(EXTRA_VPN, false)
         worker.execute {
             val result = runCatching {
-                Native.start(prefs.keyPath, prefs.server, spec).also { if (vpn) startVpn() }
+                Native.start(prefs.keyPath, spec).also { if (vpn) startVpn() }
             }
             main.post {
                 if (stopped) return@post
                 result.onSuccess { out ->
                     State.forwards = out.lines().filter { it.isNotBlank() }.associate { l ->
-                        val (proto, addr, name) = l.split(' ', limit = 3)
-                        "$proto $name" to addr.takeIf { it != "-" }
+                        val (server, proto, addr, name) = l.split(' ', limit = 4)
+                        "$server $proto $name" to addr.takeIf { it != "-" }
                     }
                     State.running = true
                     State.vpn = vpn
@@ -161,12 +161,16 @@ class ProxyService : VpnService() {
         private const val NOTIFICATION = 1
         private const val ACTION_STOP = "stop"
         private const val EXTRA_SPEC = "spec"
+        private const val EXTRA_VPN = "vpn"
 
         /** Serializes start/stop so a quick Stop then Start can't run out of order. */
         private val worker = Executors.newSingleThreadExecutor()
 
-        fun start(ctx: Context, spec: String) {
-            ctx.startForegroundService(Intent(ctx, ProxyService::class.java).putExtra(EXTRA_SPEC, spec))
+        /** [spec] as for [Native.start]; [vpn] if any of its services has hostnames. */
+        fun start(ctx: Context, spec: String, vpn: Boolean) {
+            ctx.startForegroundService(
+                Intent(ctx, ProxyService::class.java).putExtra(EXTRA_SPEC, spec).putExtra(EXTRA_VPN, vpn),
+            )
         }
 
         fun stop(ctx: Context) {

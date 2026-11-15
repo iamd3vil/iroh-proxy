@@ -5,11 +5,14 @@ For people who just need the homelab services on their phone. The app runs the s
 
 ## Use
 
-1. Install the APK, open it, and send the **device ID** to the server's owner.
+1. Install the APK, open it, and send the **device ID** to each server's owner (it is the same for
+   every server).
 2. They add it to `allowed` in `server.toml` and restart the server.
-3. Paste the **server ID** and tap Save. The server's services are listed automatically.
-4. Change a local port or switch a service off if you like, then tap **Connect**. Point other apps
-   at the address shown (e.g. `127.0.0.1:8096`). A notification stays up while connected.
+3. Paste a **server ID** (and optionally a name) and tap Add server; repeat for more servers. Each
+   server's services are listed automatically.
+4. Change a local port or switch a service off if you like, then tap **Connect**, which connects
+   to every server at once. Point other apps at the address shown (e.g. `127.0.0.1:8096`). A
+   notification stays up while connected.
 
 A service's default port is the port it has on the server side. Ports that are taken, or below
 1024 (not allowed on Android), fall back to a random free port.
@@ -30,7 +33,8 @@ proxy = ["*.example.com"]   # exact names, or *.suffix for any subdomain
 Connect then asks for VPN permission. The VPN carries only `198.18.0.0/16`, and the app becomes
 the phone's DNS server: names matching a pattern resolve to a virtual IP that reaches the service
 on its port (443 here), so `https://jelly.example.com` works unchanged, certificate included.
-Other names are forwarded to the network's own DNS servers, and all other traffic bypasses the
+Hostnames from all servers share one VPN; if two servers claim the same name and port, the one
+added first wins. Other names are forwarded to the network's own DNS servers, and all other traffic bypasses the
 VPN. Only TCP is carried this way.
 
 Limits: Android allows one VPN at a time, and a Private DNS setting with a specific hostname

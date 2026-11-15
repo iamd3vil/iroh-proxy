@@ -1,17 +1,19 @@
 //! JNI bindings for the Android app (`app.irohproxy.Native`).
 //!
-//! Lists cross the boundary as text lines: services as `tcp|udp <port> <name>` (the discovery
-//! listing format), forwards as `tcp|udp <local addr or -> <name>`. Errors become Java exceptions.
+//! Lists cross the boundary as text lines: a server's services in the discovery listing format;
+//! what to forward as that format in `server <id>` sections; forwards as
+//! `<server> tcp|udp <local addr or -> <name>`. Errors become Java exceptions.
 
 mod vpn;
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use anyhow::{Context, Result};
-use iroh_proxy::{Client, PeerId, Service, load_or_create_key, parse_services, service_lines};
+use iroh_proxy::{Client, Endpoint, PeerId, Service, bind, load_or_create_key, parse_services, service_lines};
 use jni::{
     JNIEnv,
     objects::{JClass, JObject, JString},
@@ -22,13 +24,28 @@ use tokio::{runtime::Runtime, time::timeout};
 /// Dialing a server that is offline can otherwise hang for a long time.
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-/// One client endpoint per process: two endpoints with the same key would fight over the id.
+/// One endpoint per process (two with the same key would fight over the id), with a client per
+/// server on it: every server sees the same device id.
 struct Session {
     rt: Runtime,
-    client: Arc<Client>,
-    server: PeerId,
+    ep: Endpoint,
+    clients: HashMap<PeerId, Arc<Client>>,
     /// What [`start`] was asked to forward; VPN mode routes these services' hostnames.
-    services: Vec<Service>,
+    services: Vec<(Arc<Client>, Service)>,
+}
+
+impl Session {
+    fn open(key_path: &str) -> Result<Self> {
+        let key = load_or_create_key(key_path)?;
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let ep = rt.block_on(bind(key, None))?;
+        Ok(Self { rt, ep, clients: HashMap::new(), services: vec![] })
+    }
+
+    fn client(&mut self, server: &str) -> Result<Arc<Client>> {
+        let id: PeerId = server.trim().parse().with_context(|| format!("invalid server id {server:?}"))?;
+        Ok(self.clients.entry(id).or_insert_with(|| Client::with_endpoint(self.ep.clone(), id)).clone())
+    }
 }
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
@@ -39,41 +56,48 @@ fn close(session: &mut Option<Session>) {
     }
 }
 
-fn open(key_path: &str, server: &str) -> Result<Session> {
-    let server: PeerId = server.trim().parse().context("invalid server id")?;
-    let key = load_or_create_key(key_path)?;
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let client = rt.block_on(Client::new(key, server, None))?;
-    Ok(Session { rt, client, server, services: vec![] })
-}
-
 fn services(key_path: &str, server: &str) -> Result<String> {
-    let mut session = SESSION.lock().unwrap();
-    let wanted: PeerId = server.trim().parse().context("invalid server id")?;
-    if session.as_ref().is_none_or(|s| s.server != wanted) {
-        close(&mut session);
-        *session = Some(open(key_path, server)?);
-    }
-    let s = session.as_ref().unwrap();
-    let list = s.rt.block_on(async { timeout(TIMEOUT, s.client.services()).await }).context("server did not answer")??;
+    let (rt, client) = {
+        let mut session = SESSION.lock().unwrap();
+        if session.is_none() {
+            *session = Some(Session::open(key_path)?);
+        }
+        let s = session.as_mut().unwrap();
+        (s.rt.handle().clone(), s.client(server)?)
+    }; // unlocked, so one slow server doesn't hold up the others
+    let list = rt.block_on(async { timeout(TIMEOUT, client.services()).await }).context("server did not answer")??;
     Ok(list.iter().map(service_lines).collect())
 }
 
 /// Replaces any session with a fresh one forwarding each service in `spec` (port 0 or a taken
 /// port falls back to a random one).
-fn start(key_path: &str, server: &str, spec: &str) -> Result<String> {
+fn start(key_path: &str, spec: &str) -> Result<String> {
     let mut session = SESSION.lock().unwrap();
     close(&mut session);
-    let mut s = open(key_path, server)?;
-    s.services = parse_services(spec);
+    let mut s = Session::open(key_path)?;
+    let mut sections: Vec<(&str, String)> = Vec::new();
+    for line in spec.lines() {
+        match line.strip_prefix("server ") {
+            Some(server) => sections.push((server, String::new())),
+            None => {
+                let (_, body) = sections.last_mut().context("spec must start with a server line")?;
+                *body += line;
+                body.push('\n');
+            }
+        }
+    }
+    for (server, body) in sections {
+        let client = s.client(server)?;
+        s.services.extend(parse_services(&body).into_iter().map(|svc| (client.clone(), svc)));
+    }
     let out = s.rt.block_on(async {
         let mut out = String::new();
-        for svc in &s.services {
-            let local = match s.client.expose(svc, None).await {
+        for (client, svc) in &s.services {
+            let local = match client.expose(svc, None).await {
                 Ok(a) => a.to_string(),
                 Err(_) => "-".into(),
             };
-            out += &format!("{} {local} {}\n", proto(svc), svc.name);
+            out += &format!("{} {} {local} {}\n", client.server(), proto(svc), svc.name);
         }
         out
     });
@@ -89,9 +113,8 @@ fn start_vpn(fd: i32) -> Result<()> {
     let s = session.as_ref().context("not connected")?;
     let table = vpn::Table::new(&s.services);
     anyhow::ensure!(!table.is_empty(), "no service has hostnames");
-    let client = s.client.clone();
     s.rt.spawn(async move {
-        if let Err(e) = vpn::run(fd, table, client).await {
+        if let Err(e) = vpn::run(fd, table).await {
             log(&format!("vpn: {e:#}"));
         }
     });
@@ -181,14 +204,8 @@ pub extern "system" fn Java_app_irohproxy_Native_services(mut env: JNIEnv, _: JC
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_app_irohproxy_Native_start(
-    mut env: JNIEnv,
-    _: JClass,
-    key_path: JString,
-    server: JString,
-    spec: JString,
-) -> jstring {
-    ret(&mut env, |env| start(&string(env, &key_path)?, &string(env, &server)?, &string(env, &spec)?))
+pub extern "system" fn Java_app_irohproxy_Native_start(mut env: JNIEnv, _: JClass, key_path: JString, spec: JString) -> jstring {
+    ret(&mut env, |env| start(&string(env, &key_path)?, &string(env, &spec)?))
 }
 
 #[unsafe(no_mangle)]

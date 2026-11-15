@@ -3,7 +3,8 @@
 //! The app's VPN routes only [`NET`]. It is also the phone's DNS server ([`DNS_IP`]): names a
 //! service claims resolve to a virtual IP (one per hostname pattern), everything else is forwarded
 //! to the real network's resolvers. TCP to `virtual IP:port` is terminated here by smoltcp and
-//! streamed to the service with that hostname and port; anything else is refused.
+//! streamed to the service with that hostname and port (on whichever server offers it); anything
+//! else is refused.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -61,26 +62,28 @@ pub fn set_upstream(mut servers: Vec<SocketAddr>) {
     *UPSTREAM.lock().unwrap() = servers;
 }
 
-/// Which names resolve to which virtual IP, and which service each `virtual IP:port` reaches.
-pub struct Table {
+/// Which names resolve to which virtual IP, and which service (a `T`, e.g. the server's client,
+/// plus the service name) each `virtual IP:port` reaches.
+pub struct Table<T> {
     names: Vec<(String, Ipv4Addr)>,
-    ports: HashMap<SocketAddrV4, String>,
+    ports: HashMap<SocketAddrV4, (T, String)>,
 }
 
-impl Table {
-    /// From the TCP services' hostnames; UDP isn't routed in VPN mode.
-    pub fn new(services: &[Service]) -> Self {
-        let tcp = || services.iter().filter(|s| !s.udp);
-        let mut patterns: Vec<String> = tcp().flat_map(|s| s.hostnames.iter().map(|h| normalize(h))).collect();
+impl<T: Clone> Table<T> {
+    /// From the TCP services' hostnames; UDP isn't routed in VPN mode. When services (e.g. on two
+    /// servers) claim the same name and port, the first one listed wins.
+    pub fn new(services: &[(T, Service)]) -> Self {
+        let tcp = || services.iter().filter(|(_, s)| !s.udp);
+        let mut patterns: Vec<String> = tcp().flat_map(|(_, s)| s.hostnames.iter().map(|h| normalize(h))).collect();
         patterns.sort();
         patterns.dedup();
         let names: Vec<(String, Ipv4Addr)> =
             patterns.into_iter().enumerate().map(|(i, p)| (p, Ipv4Addr::from(u32::from(FIRST_VIP) + i as u32))).collect();
         let mut ports = HashMap::new();
-        for svc in tcp() {
+        for (target, svc) in tcp() {
             for h in &svc.hostnames {
                 let vip = names.iter().find(|(p, _)| *p == normalize(h)).unwrap().1;
-                ports.entry(SocketAddrV4::new(vip, svc.port)).or_insert_with(|| svc.name.clone());
+                ports.entry(SocketAddrV4::new(vip, svc.port)).or_insert_with(|| (target.clone(), svc.name.clone()));
             }
         }
         Self { names, ports }
@@ -316,7 +319,7 @@ fn sys(n: isize) -> io::Result<usize> {
 }
 
 /// Serves the TUN `fd` until it fails or the task is dropped (which closes it, ending the VPN).
-pub async fn run(fd: OwnedFd, table: Table, client: Arc<Client>) -> Result<()> {
+pub async fn run(fd: OwnedFd, table: Table<Arc<Client>>) -> Result<()> {
     unsafe {
         let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
         libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -383,8 +386,8 @@ pub async fn run(fd: OwnedFd, table: Table, client: Arc<Client>) -> Result<()> {
                     if let Ok(tcp) = TcpPacket::new_checked(ip.payload()) {
                         let key = (SocketAddrV4::new(src_ip, tcp.src_port()), SocketAddrV4::new(dst_ip, tcp.dst_port()));
                         if tcp.syn() && !tcp.ack() && !conns.contains_key(&key)
-                            && let Some(service) = table.ports.get(&key.1)
-                            && let Some(conn) = accept(key.1, service, &client, &notify, &mut sockets)
+                            && let Some((client, service)) = table.ports.get(&key.1)
+                            && let Some(conn) = accept(key.1, service, client, &notify, &mut sockets)
                         {
                             conns.insert(key, conn);
                         }
@@ -522,20 +525,26 @@ async fn bridge(
 mod tests {
     use super::*;
 
-    fn svc(name: &str, port: u16, hosts: &[&str]) -> Service {
-        Service { name: name.into(), udp: false, port, hostnames: hosts.iter().map(|h| h.to_string()).collect() }
+    fn svc(server: u8, name: &str, port: u16, hosts: &[&str]) -> (u8, Service) {
+        (server, Service { name: name.into(), udp: false, port, hostnames: hosts.iter().map(|h| h.to_string()).collect() })
     }
 
     #[test]
     fn resolves_exact_before_wildcard() {
-        let t = Table::new(&[svc("proxy", 443, &["*.example.com"]), svc("proxy-http", 80, &["*.example.com"]), svc("jf", 8096, &["JF.example.com."])]);
+        let t = Table::new(&[
+            svc(1, "proxy", 443, &["*.example.com"]),
+            svc(1, "proxy-http", 80, &["*.example.com"]),
+            svc(2, "jf", 8096, &["JF.example.com."]),
+            svc(2, "other-proxy", 443, &["*.example.com"]), // loses to server 1's
+        ]);
         let wild = t.resolve("jelly.example.com").unwrap();
         assert_eq!(t.resolve("a.b.example.com."), Some(wild));
         assert_ne!(t.resolve("jf.example.com"), Some(wild));
         assert_eq!(t.resolve("example.com"), None);
         assert_eq!(t.resolve("badexample.com"), None);
-        assert_eq!(t.ports[&SocketAddrV4::new(wild, 443)], "proxy");
-        assert_eq!(t.ports[&SocketAddrV4::new(wild, 80)], "proxy-http");
+        assert_eq!(t.ports[&SocketAddrV4::new(wild, 443)], (1, "proxy".into()));
+        assert_eq!(t.ports[&SocketAddrV4::new(wild, 80)], (1, "proxy-http".into()));
+        assert_eq!(t.ports[&SocketAddrV4::new(t.resolve("jf.example.com").unwrap(), 8096)], (2, "jf".into()));
         assert!(!t.ports.contains_key(&SocketAddrV4::new(wild, 22)));
     }
 

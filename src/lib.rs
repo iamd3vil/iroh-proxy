@@ -20,8 +20,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+pub use iroh::Endpoint;
 use iroh::{
-    Endpoint, EndpointId, RelayMode, SecretKey,
+    EndpointId, RelayMode, SecretKey,
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -120,10 +121,12 @@ pub fn load_or_create_key(path: impl AsRef<Path>) -> Result<SecretKey> {
     }
 }
 
+/// Binds an iroh endpoint with `key`, for [`Client::with_endpoint`].
+///
 /// `relay`: your own iroh-relay instead of n0's public ones. Relayed traffic goes through the
 /// *dialed* endpoint's relay, so setting it on the server alone is enough; a client left on n0
 /// still gets QUIC address discovery from n0 for hole punching.
-async fn bind(key: SecretKey, relay: Option<RelayUrl>) -> Result<Endpoint> {
+pub async fn bind(key: SecretKey, relay: Option<RelayUrl>) -> Result<Endpoint> {
     let mut b = Endpoint::builder(presets::N0).secret_key(key);
     if let Some(url) = relay {
         b = b.relay_mode(RelayMode::Custom(url.into()));
@@ -294,12 +297,22 @@ pub struct Client {
 
 impl Client {
     pub async fn new(key: SecretKey, server: EndpointId, relay: Option<RelayUrl>) -> Result<Arc<Self>> {
-        let ep = bind(key, relay).await?;
-        Ok(Arc::new(Self { ep, server, conn: Mutex::new(None), udp: Default::default(), next_flow: AtomicU32::new(0) }))
+        Ok(Self::with_endpoint(bind(key, relay).await?, server))
+    }
+
+    /// A client for `server` on an existing endpoint, so one key (one client id) can reach
+    /// several servers. See [`bind`].
+    pub fn with_endpoint(ep: Endpoint, server: EndpointId) -> Arc<Self> {
+        Arc::new(Self { ep, server, conn: Mutex::new(None), udp: Default::default(), next_flow: AtomicU32::new(0) })
     }
 
     pub fn id(&self) -> EndpointId {
         self.ep.id()
+    }
+
+    /// The server this client talks to.
+    pub fn server(&self) -> EndpointId {
+        self.server
     }
 
     /// The live connection, (re)connecting if it is gone (e.g. after laptop sleep).

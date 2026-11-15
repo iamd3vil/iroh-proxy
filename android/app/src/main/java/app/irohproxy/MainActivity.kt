@@ -46,7 +46,6 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -57,6 +56,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -91,44 +91,52 @@ fun App() {
     val prefs = remember { Prefs(ctx) }
     val scope = rememberCoroutineScope()
     var clientId by remember { mutableStateOf("") }
-    var server by remember { mutableStateOf(prefs.server) } // the text field
-    var saved by remember { mutableStateOf(prefs.server) } // prefs.server, observable by Compose
-    val services = remember { mutableStateListOf<Svc>() }
-    val ports = remember { mutableStateMapOf<String, String>() } // port text field per service key
+    var servers by remember { mutableStateOf(prefs.servers) }
+    var newId by remember { mutableStateOf("") }
+    var newName by remember { mutableStateOf("") }
+    val services = remember { mutableStateMapOf<String, List<Svc>>() } // by server id
+    val loading = remember { mutableStateMapOf<String, Boolean>() }
+    val errors = remember { mutableStateMapOf<String, String>() }
+    val ports = remember { mutableStateMapOf<String, String>() } // port text field per Svc.key
     val enabled = remember { mutableStateMapOf<String, Boolean>() }
-    var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val running = ProxyService.State.running
-    var pendingSpec by remember { mutableStateOf<String?>(null) }
+    var pending by remember { mutableStateOf<String?>(null) } // spec waiting for VPN consent
     val vpnConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
-        val spec = pendingSpec
-        pendingSpec = null
-        if (r.resultCode == android.app.Activity.RESULT_OK && spec != null) ProxyService.start(ctx, spec)
+        val spec = pending
+        pending = null
+        if (r.resultCode == android.app.Activity.RESULT_OK && spec != null) ProxyService.start(ctx, spec, vpn = true)
         else error = "VPN permission is needed to reach services by name."
     }
 
-    fun refresh() {
-        if (prefs.server.isBlank()) return
-        loading = true
-        error = null
+    fun refresh(server: String) {
+        loading[server] = true
+        errors.remove(server)
         scope.launch {
-            val r = withContext(Dispatchers.IO) { runCatching { Native.services(prefs.keyPath, prefs.server) } }
-            loading = false
+            val r = withContext(Dispatchers.IO) { runCatching { Native.services(prefs.keyPath, server) } }
+            loading.remove(server)
             r.onSuccess { out ->
-                val list = Svc.parse(out)
-                services.clear()
-                services.addAll(list)
+                val list = Svc.parse(out, server)
+                services[server] = list
                 for (s in list) {
                     ports.getOrPut(s.key) { (prefs.port(s) ?: s.port).toString() }
                     enabled.getOrPut(s.key) { prefs.enabled(s) }
                 }
-            }.onFailure { error = it.message ?: it.toString() }
+            }.onFailure {
+                services.remove(server)
+                errors[server] = it.message ?: it.toString()
+            }
         }
+    }
+
+    fun saveServers(list: List<Server>) {
+        servers = list
+        prefs.servers = list
     }
 
     LaunchedEffect(Unit) {
         clientId = withContext(Dispatchers.IO) { Native.clientId(prefs.keyPath) }
-        refresh()
+        servers.forEach { refresh(it.id) }
     }
 
     Column(
@@ -139,7 +147,7 @@ fun App() {
 
         Section("Your device ID") {
             Text(
-                "Send this to whoever runs the server, so they can let this phone in.",
+                "Send this to whoever runs each server, so they can let this phone in.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             SelectionContainer {
@@ -154,71 +162,112 @@ fun App() {
             }
         }
 
-        Section("Server") {
+        Section("Servers") {
+            for (srv in servers) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(srv.label, style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            srv.id,
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    TextButton(onClick = {
+                        saveServers(servers - srv)
+                        services.remove(srv.id)
+                        errors.remove(srv.id)
+                    }, enabled = !running) { Text("Remove") }
+                }
+            }
             OutlinedTextField(
-                value = server,
-                onValueChange = { server = it },
+                value = newId,
+                onValueChange = { newId = it.trim() },
                 label = { Text("Server ID") },
                 singleLine = true,
                 enabled = !running,
                 modifier = Modifier.fillMaxWidth(),
             )
-            Button(
-                onClick = {
-                    prefs.server = server
-                    saved = prefs.server
-                    services.clear()
-                    refresh()
-                },
-                enabled = !running && server.isNotBlank() && !loading,
-            ) { Text(if (saved.isNotBlank() && server.trim() == saved) "Refresh services" else "Save") }
+            OutlinedTextField(
+                value = newName,
+                onValueChange = { newName = it },
+                label = { Text("Name (optional)") },
+                singleLine = true,
+                enabled = !running,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        val srv = Server(newId, newName.trim())
+                        saveServers(servers + srv)
+                        newId = ""
+                        newName = ""
+                        refresh(srv.id)
+                    },
+                    enabled = !running && newId.isNotEmpty() && servers.none { it.id == newId },
+                ) { Text("Add server") }
+                OutlinedButton(
+                    onClick = { servers.forEach { refresh(it.id) } },
+                    enabled = servers.isNotEmpty() && loading.isEmpty(),
+                ) { Text("Refresh") }
+            }
         }
 
-        if (saved.isNotBlank()) Section("Services") {
-            if (loading) CircularProgressIndicator(Modifier.size(24.dp))
-            error?.let {
-                Text(
-                    "Couldn't reach the server. It may be offline, or this phone isn't allowed in yet " +
-                        "(send your device ID to the server's owner).",
-                    color = MaterialTheme.colorScheme.error,
-                )
-                Text(it, style = MaterialTheme.typography.bodySmall)
+        if (servers.isNotEmpty()) Section("Services") {
+            for (srv in servers) {
+                Text(srv.label, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+                if (loading[srv.id] == true) CircularProgressIndicator(Modifier.size(24.dp))
+                errors[srv.id]?.let {
+                    Text(
+                        "Couldn't reach this server. It may be offline, or this phone isn't allowed in yet " +
+                            "(send your device ID to the server's owner).",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Text(it, style = MaterialTheme.typography.bodySmall)
+                }
+                val list = services[srv.id]
+                if (list != null && list.isEmpty()) Text("This server offers no services.")
+                for (s in list.orEmpty()) {
+                    ServiceRow(
+                        svc = s,
+                        port = ports[s.key] ?: "",
+                        onPort = { ports[s.key] = it.filter(Char::isDigit).take(5) },
+                        enabled = enabled[s.key] ?: true,
+                        onEnabled = { enabled[s.key] = it; prefs.setEnabled(s, it) },
+                        running = running,
+                        forward = ProxyService.State.forwards[s.key],
+                        ctx = ctx,
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
             }
-            ProxyService.State.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            if (!loading && error == null && services.isEmpty()) Text("The server offers no services.")
-            for (s in services) {
-                ServiceRow(
-                    svc = s,
-                    port = ports[s.key] ?: "",
-                    onPort = { ports[s.key] = it.filter(Char::isDigit).take(5) },
-                    enabled = enabled[s.key] ?: true,
-                    onEnabled = { enabled[s.key] = it; prefs.setEnabled(s, it) },
-                    running = running,
-                    forward = ProxyService.State.forwards[s.key],
-                    ctx = ctx,
-                )
-            }
-            Spacer(Modifier.height(4.dp))
+            (ProxyService.State.error ?: error)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            val all = servers.flatMap { services[it.id].orEmpty() }
             if (running) {
                 Button(onClick = { ProxyService.stop(ctx) }, modifier = Modifier.fillMaxWidth()) { Text("Disconnect") }
             } else {
                 Button(
                     onClick = {
-                        val chosen = services.filter { enabled[it.key] ?: true }
-                        val spec = chosen.joinToString("") { s ->
+                        error = null
+                        val chosen = all.filter { enabled[it.key] ?: true }
+                        val spec = Svc.spec(chosen) { s ->
                             val port = ports[s.key]?.toIntOrNull()?.takeIf { it in 0..65535 } ?: s.port
                             prefs.setPort(s, port)
-                            s.lines(port)
+                            port
                         }
-                        val consent = if (chosen.any { it.needsVpn }) VpnService.prepare(ctx) else null
+                        val vpn = chosen.any { it.needsVpn }
+                        val consent = if (vpn) VpnService.prepare(ctx) else null
                         if (consent != null) {
-                            pendingSpec = spec
+                            pending = spec
                             vpnConsent.launch(consent)
                         } else {
-                            ProxyService.start(ctx, spec)
+                            ProxyService.start(ctx, spec, vpn)
                         }
                     },
-                    enabled = services.any { enabled[it.key] ?: true },
+                    enabled = all.any { enabled[it.key] ?: true },
                     modifier = Modifier.fillMaxWidth(),
                 ) { Text("Connect") }
             }
