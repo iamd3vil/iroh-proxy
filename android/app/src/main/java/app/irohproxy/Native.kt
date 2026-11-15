@@ -27,7 +27,22 @@ object Native {
     /** The real network's DNS servers, one IP per line, for names the VPN doesn't answer. */
     external fun setDns(servers: String)
 
+    /** Each connected server's path: `<server> direct|relay <addr> <rtt ms>` lines. */
+    external fun paths(): String
+
     external fun stop()
+}
+
+/** How the connection to a server travels: directly to [addr] (ip:port), or via the relay [addr]. */
+data class PathInfo(val relay: Boolean, val addr: String, val rttMs: Long) {
+    companion object {
+        /** [Native.paths] output, by server id. */
+        fun parse(text: String): Map<String, PathInfo> = text.lines().mapNotNull { l ->
+            val p = l.split(' ')
+            if (p.size != 4) return@mapNotNull null
+            p[0] to PathInfo(p[1] == "relay", p[2], p[3].toLongOrNull() ?: return@mapNotNull null)
+        }.toMap()
+    }
 }
 
 /** A server the user added; [name] is their own label for it. */

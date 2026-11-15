@@ -108,6 +108,7 @@ async fn allowed_peer_reaches_service_and_stranger_does_not() {
     assert!(found.iter().any(|s| s.name == "dns" && s.dns), "dns service must be advertised: {found:?}");
     assert_eq!(found.len(), 3);
     assert_eq!(ok.dns_query("dns", b"query").await.unwrap(), b"re:query");
+    assert!(ok.path().is_some(), "a connected client reports its path");
     // The echo server already holds its own port, so expose must fall back to a random one.
     let local = ok.expose(&echo, None).await.unwrap();
     assert_ne!(local.port(), tcp_port);

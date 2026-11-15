@@ -73,6 +73,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -114,6 +115,7 @@ fun App() {
     val errors = remember { mutableStateMapOf<String, String>() }
     val ports = remember { mutableStateMapOf<String, String>() } // port text field per Svc.key
     val enabled = remember { mutableStateMapOf<String, Boolean>() }
+    var paths by remember { mutableStateOf<Map<String, PathInfo>>(emptyMap()) } // by server id
     var error by remember { mutableStateOf<String?>(null) }
     var adding by remember { mutableStateOf(false) }
     var explainVpn by remember { mutableStateOf<Intent?>(null) } // Android's consent screen, after ours
@@ -178,6 +180,13 @@ fun App() {
         servers.forEach { refresh(it.id) }
     }
 
+    LaunchedEffect(Unit) { // how each connection travels; changes as iroh finds a direct path
+        while (true) {
+            paths = withContext(Dispatchers.IO) { runCatching { PathInfo.parse(Native.paths()) }.getOrDefault(emptyMap()) }
+            delay(2000)
+        }
+    }
+
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
@@ -209,6 +218,7 @@ fun App() {
                     enabled = enabled,
                     forwards = state.forwards,
                     dnsKey = dns?.key,
+                    path = paths[srv.id],
                     onEnabled = { s, on -> enabled[s.key] = on; prefs.setEnabled(s, on) },
                     onRetry = { refresh(srv.id) },
                 )
@@ -369,6 +379,7 @@ private fun ServerServices(
     enabled: Map<String, Boolean>,
     forwards: Map<String, String?>,
     dnsKey: String?,
+    path: PathInfo?,
     onEnabled: (Svc, Boolean) -> Unit,
     onRetry: () -> Unit,
 ) {
@@ -382,6 +393,7 @@ private fun ServerServices(
             )
             if (loading) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
         }
+        if (path != null && error == null) PathLine(path)
         if (error != null) {
             Problem(
                 "Can't reach this server right now. It may be offline, or it hasn't let this phone in yet.",
@@ -409,6 +421,26 @@ private fun ServerServices(
                 }
             }
         }
+    }
+}
+
+/** "Direct · 192.168.1.5:41641 · 3 ms" or "Relayed via relay.example.com · 180 ms". */
+@Composable
+private fun PathLine(path: PathInfo) {
+    val rtt = if (path.rttMs < 1) "<1 ms" else "${path.rttMs} ms"
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Surface(
+            shape = CircleShape,
+            color = if (path.relay) Color(0xFFF9A825) else Color(0xFF2E7D32),
+            modifier = Modifier.size(8.dp),
+        ) {}
+        Text(
+            if (path.relay) "Relayed via ${path.addr} · $rtt" else "Direct · ${path.addr} · $rtt",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

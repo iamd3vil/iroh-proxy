@@ -230,6 +230,20 @@ pub extern "system" fn Java_app_irohproxy_Native_setDns(mut env: JNIEnv, _: JCla
     }
 }
 
+/// Each connected server's path: `<server> direct|relay <ip:port or relay host> <rtt ms>` lines.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_irohproxy_Native_paths(mut env: JNIEnv, _: JClass) -> jstring {
+    ret(&mut env, |_| {
+        let session = SESSION.lock().unwrap();
+        let Some(s) = session.as_ref() else { return Ok(String::new()) };
+        Ok(s.clients
+            .iter()
+            .filter_map(|(id, c)| c.path().map(|p| (id, p)))
+            .map(|(id, p)| format!("{id} {} {} {}\n", if p.relay { "relay" } else { "direct" }, p.addr, p.rtt.as_millis()))
+            .collect())
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_app_irohproxy_Native_stop(_: JNIEnv, _: JClass) {
     close(&mut SESSION.lock().unwrap());

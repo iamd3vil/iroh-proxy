@@ -23,7 +23,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 pub use iroh::Endpoint;
 use iroh::{
-    EndpointId, RelayMode, SecretKey,
+    EndpointId, RelayMode, SecretKey, TransportAddr,
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -313,6 +313,16 @@ pub async fn serve(
 
 // ---------- client ----------
 
+/// How a client's connection to its server currently travels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathInfo {
+    /// Through a relay server, rather than direct UDP.
+    pub relay: bool,
+    /// The server's IP address and port, or the relay's hostname.
+    pub addr: String,
+    pub rtt: Duration,
+}
+
 type ClientFlows = Arc<std::sync::Mutex<HashMap<u32, (Arc<UdpSocket>, SocketAddr)>>>;
 
 pub struct Client {
@@ -336,6 +346,19 @@ impl Client {
 
     pub fn id(&self) -> EndpointId {
         self.ep.id()
+    }
+
+    /// The connection's selected path, if connected (and not in the middle of connecting).
+    pub fn path(&self) -> Option<PathInfo> {
+        let conn = self.conn.try_lock().ok()?.clone().filter(|c| c.close_reason().is_none())?;
+        let list = conn.paths();
+        let p = list.iter().find(|p| p.is_selected())?;
+        let addr = match p.remote_addr() {
+            TransportAddr::Ip(a) => a.to_string(),
+            TransportAddr::Relay(url) => url.host_str().unwrap_or_default().trim_end_matches('.').to_owned(),
+            other => format!("{other:?}"),
+        };
+        Some(PathInfo { relay: p.is_relay(), addr, rtt: p.rtt() })
     }
 
     /// The server this client talks to.
