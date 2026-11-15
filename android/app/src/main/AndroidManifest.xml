@@ -33,10 +33,10 @@
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
-            <!-- It needs a server and services chosen in the app first. -->
+            <!-- Started by Android for Always-on VPN: uses the servers saved in the app. -->
             <meta-data
                 android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
-                android:value="false" />
+                android:value="true" />
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Forwards local ports to the user's own server over a peer-to-peer tunnel" />

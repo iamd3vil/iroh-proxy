@@ -14,7 +14,11 @@ object Native {
     /** This device's id, creating its key at [keyPath] if needed. */
     external fun clientId(keyPath: String): String
 
-    /** The server's services, in the listing format (see [Svc.parse]). */
+    /** Redeems the invite code found in [text] (see [Invite]); returns the server's id. Throws if
+     *  the server refuses it. */
+    external fun redeem(keyPath: String, text: String): String
+
+    /** The server's listing: its services (see [Svc.parse]) and name (see [serverName]). */
     external fun services(keyPath: String, server: String): String
 
     /** Forwards each service in [spec] (see [spec]), replacing earlier forwards. Returns
@@ -47,7 +51,19 @@ data class PathInfo(val relay: Boolean, val addr: String, val rttMs: Long) {
 
 /** A server the user added; [name] is their own label for it. */
 data class Server(val id: String, val name: String) {
-    val label get() = name.ifBlank { id.take(12) + "…" }
+    /** The user's name for it, else the one it advertises, else the start of its id. */
+    fun label(advertised: String?) = name.ifBlank { advertised?.ifBlank { null } ?: (id.take(12) + "…") }
+}
+
+/** The server's own name from its listing, if it has one. */
+fun serverName(listing: String) = listing.lines().firstOrNull { it.startsWith("name ") }?.removePrefix("name ")
+
+/** An invite code (`<server id>.<token>`) found anywhere in a pasted message. */
+object Invite {
+    private val CODE = Regex("([0-9a-fA-F]{64})\\.([0-9a-fA-F]{32})")
+
+    /** The server id of the invite in [text], if there is one. */
+    fun server(text: String) = CODE.find(text)?.groupValues?.get(1)?.lowercase()
 }
 
 /** A service offered by [server]; [port] is its suggested local port. [hostnames] are reached

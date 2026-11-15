@@ -92,10 +92,6 @@ impl<T: Clone> Table<T> {
         Self { names, ports }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
-    }
-
     #[cfg(test)]
     fn resolve(&self, name: &str) -> Option<Ipv4Addr> {
         self.names.resolve(name)

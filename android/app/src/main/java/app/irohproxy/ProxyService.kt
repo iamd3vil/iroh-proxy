@@ -41,21 +41,23 @@ class ProxyService : VpnService() {
     private var dnsWatch: ConnectivityManager.NetworkCallback? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val spec = intent?.getStringExtra(EXTRA_SPEC)
-        if (intent?.action == ACTION_STOP || spec == null) {
+        if (intent?.action == ACTION_STOP) {
             shutdown()
             return START_NOT_STICKY
         }
+        // No spec: Android started us (Always-on VPN, or after a reboot), so use the saved setup.
+        val spec = intent?.getStringExtra(EXTRA_SPEC)
         stopped = false
         Native.init(applicationContext)
         startForeground(notification("Connecting…"))
         State.error = null
         State.connecting = true
         val prefs = Prefs(this)
-        val vpn = intent.getBooleanExtra(EXTRA_VPN, false)
+        // Android expects a VPN when it started us itself.
+        val vpn = spec == null || intent?.getBooleanExtra(EXTRA_VPN, false) == true
         worker.execute {
             val result = runCatching {
-                Native.start(prefs.keyPath, spec).also { if (vpn) startVpn() }
+                Native.start(prefs.keyPath, spec ?: savedSpec(prefs)).also { if (vpn) startVpn() }
             }
             main.post {
                 State.connecting = false
@@ -98,6 +100,17 @@ class ProxyService : VpnService() {
         worker.execute { Native.stop() } // closes the VPN interface too
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    /** What the user last chose, for starts without the app: every saved server's enabled services
+     *  on their saved ports. Servers that can't be reached right now are skipped. Blocks. */
+    private fun savedSpec(prefs: Prefs): String {
+        val servers = prefs.servers
+        check(servers.isNotEmpty()) { "No servers added yet" }
+        val chosen = servers.flatMap { srv ->
+            runCatching { Svc.parse(Native.services(prefs.keyPath, srv.id), srv.id) }.getOrDefault(emptyList())
+        }.filter { prefs.enabled(it) }
+        return Svc.spec(chosen) { prefs.port(it) ?: it.port }
     }
 
     /** Routes only the VPN range through us; we are the phone's DNS (see android/native/src/vpn.rs). */

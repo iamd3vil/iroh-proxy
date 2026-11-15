@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use iroh_proxy::{Client, Endpoint, PeerId, Service, bind, load_or_create_key, parse_services, service_lines};
+use iroh_proxy::{Client, Endpoint, InviteRejected, PeerId, Service, bind, load_or_create_key, parse_invite, parse_services};
 use jni::{
     JNIEnv,
     objects::{JClass, JObject, JString},
@@ -65,8 +65,37 @@ fn services(key_path: &str, server: &str) -> Result<String> {
         let s = session.as_mut().unwrap();
         (s.rt.handle().clone(), s.client(server)?)
     }; // unlocked, so one slow server doesn't hold up the others
-    let list = rt.block_on(async { timeout(TIMEOUT, client.services()).await }).context("server did not answer")??;
-    Ok(list.iter().map(service_lines).collect())
+    rt.block_on(async { timeout(TIMEOUT, client.listing()).await }).context("server did not answer")?
+}
+
+/// Redeems the invite code in `text`; returns the server's id.
+fn redeem(key_path: &str, text: &str) -> Result<String> {
+    let (server, token) = parse_invite(text).context("no invite code found")?;
+    let (rt, client) = {
+        let mut session = SESSION.lock().unwrap();
+        if session.is_none() {
+            *session = Some(Session::open(key_path)?);
+        }
+        let s = session.as_mut().unwrap();
+        (s.rt.handle().clone(), s.client(&server.to_string())?)
+    };
+    rt.block_on(async {
+        // A server that just started may not be findable yet; a refused invite is final.
+        let mut tries = 0;
+        loop {
+            match timeout(TIMEOUT, client.redeem(&token)).await {
+                Ok(Ok(())) => return Ok(server.to_string()),
+                Ok(Err(e)) if e.downcast_ref::<InviteRejected>().is_some() => return Err(e),
+                res => {
+                    tries += 1;
+                    if tries == 3 {
+                        return Err(res.map_or_else(|_| anyhow::anyhow!("the server didn't answer"), |r| r.unwrap_err()));
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            }
+        }
+    })
 }
 
 /// Replaces any session with a fresh one forwarding each service in `spec` (port 0 or a taken
@@ -117,7 +146,7 @@ fn start_vpn(fd: i32) -> Result<()> {
     let table = vpn::Table::new(&s.services);
     // The first server (in the user's order) offering DNS handles it.
     let dns = s.services.iter().find(|(_, svc)| svc.dns).map(|(c, svc)| (c.clone(), svc.name.clone()));
-    anyhow::ensure!(!table.is_empty() || dns.is_some(), "no service has hostnames or DNS");
+    // With neither hostnames nor DNS (e.g. Always-on VPN), it still forwards DNS to the network.
     if let Some((client, _)) = &dns {
         let client = client.clone();
         s.rt.spawn(async move { _ = client.services().await }); // connect now, not on the first lookup
@@ -228,6 +257,12 @@ pub extern "system" fn Java_app_irohproxy_Native_setDns(mut env: JNIEnv, _: JCla
     if let Ok(s) = string(&mut env, &servers) {
         vpn::set_upstream(s.lines().filter_map(|l| l.trim().parse().ok()).map(|ip| std::net::SocketAddr::new(ip, 53)).collect());
     }
+}
+
+/// Redeems the invite code found in `text`; returns the server's id.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_irohproxy_Native_redeem(mut env: JNIEnv, _: JClass, key_path: JString, text: JString) -> jstring {
+    ret(&mut env, |env| redeem(&string(env, &key_path)?, &string(env, &text)?))
 }
 
 /// Each connected server's path: `<server> direct|relay <ip:port or relay host> <rtt ms>` lines.

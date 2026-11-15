@@ -5,14 +5,22 @@ For people who just need the homelab services on their phone. The app runs the s
 
 ## Use
 
-1. Install the APK, open it, and tap **Share device code** to send it to each server's owner (the
-   code is the same for every server).
-2. They add it to `allowed` in `server.toml`, restart the server, and send back the **server code**
-   (the server's id, printed when it starts).
-3. Tap **Add server code** and paste it; pasting their whole message works. Repeat for more
-   servers. Each server's services are listed automatically.
-4. Tap the power button to connect to every server at once. Each service shows how to reach it,
-   with **Open** (in the browser) or **Copy**. A notification stays up while connected.
+The easy way is an invite. On the server, `iroh-proxy invite server.toml mom-phone` prints a
+one-time code. Send it to them; they tap **Paste invite** in the app (pasting the whole message is
+fine) and they're in: the server records their device in `state_dir/allowed` (by default next to
+its key file), no restart needed. Desktop clients use `iroh-proxy join client.toml <invite>`.
+
+Without an invite: tap **Share device code** and send it to the server's owner, who adds it to
+`allowed` in `server.toml` and sends back the **server code** (the server's id, printed when it
+starts) to add with **Add server**.
+
+Then tap the power button to connect to every server at once. Each service shows how to reach it,
+with **Open** (in the browser) or **Copy**, and each server how its connection travels (direct or
+through a relay). A server's `name = "Home"` is shown unless the user names it themselves.
+
+To stay connected, including after a reboot, turn on **Always-on VPN** for the app in Android's VPN
+settings (the app has a button for it); leave "Block connections without VPN" off, since only the
+servers' traffic goes through the app.
 
 Tapping a service (while disconnected) shows its settings: turn it off, or pick the port it uses
 on the phone.

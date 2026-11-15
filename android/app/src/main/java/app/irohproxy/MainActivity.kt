@@ -113,6 +113,7 @@ fun App() {
     val services = remember { mutableStateMapOf<String, List<Svc>>() } // by server id
     val loading = remember { mutableStateMapOf<String, Boolean>() }
     val errors = remember { mutableStateMapOf<String, String>() }
+    val advertised = remember { mutableStateMapOf<String, String>() } // servers' own names, by id
     val ports = remember { mutableStateMapOf<String, String>() } // port text field per Svc.key
     val enabled = remember { mutableStateMapOf<String, Boolean>() }
     var paths by remember { mutableStateOf<Map<String, PathInfo>>(emptyMap()) } // by server id
@@ -135,6 +136,7 @@ fun App() {
             val r = withContext(Dispatchers.IO) { runCatching { Native.services(prefs.keyPath, server) } }
             loading.remove(server)
             r.onSuccess { out ->
+                serverName(out)?.let { advertised[server] = it }
                 val list = Svc.parse(out, server)
                 services[server] = list
                 for (s in list) {
@@ -156,7 +158,7 @@ fun App() {
     val all = servers.flatMap { services[it.id].orEmpty() }
     val chosen = all.filter { enabled[it.key] ?: true }
     val dns = chosen.firstOrNull { it.dns } // the first server (in list order) offering DNS handles it
-    val dnsServer = dns?.let { d -> servers.firstOrNull { it.id == d.server }?.label }
+    val dnsServer = dns?.let { d -> servers.firstOrNull { it.id == d.server }?.label(advertised[d.server]) }
 
     fun connect() {
         error = null
@@ -209,7 +211,7 @@ fun App() {
             )
             for (srv in servers) {
                 ServerServices(
-                    server = srv,
+                    label = srv.label(advertised[srv.id]),
                     services = services[srv.id],
                     loading = loading[srv.id] == true,
                     error = errors[srv.id],
@@ -225,6 +227,7 @@ fun App() {
             }
             Manage(
                 servers = servers,
+                advertised = advertised,
                 clientId = clientId,
                 running = state.running,
                 onAdd = { adding = true },
@@ -268,7 +271,7 @@ fun App() {
     }
 }
 
-/** First run: what to do, in order. */
+/** First run: an invite is one step; without one, swap codes with the server's owner. */
 @Composable
 private fun Welcome(clientId: String, onAdd: () -> Unit) {
     val ctx = LocalContext.current
@@ -277,11 +280,22 @@ private fun Welcome(clientId: String, onAdd: () -> Unit) {
         style = MaterialTheme.typography.bodyLarge,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
-    Step(1, "Send your device code", "The person who runs the server needs it to let this phone in.") {
-        Button(onClick = { shareDeviceCode(ctx, clientId) }, enabled = clientId.isNotEmpty()) { Text("Share device code") }
+    Step(1, "Got an invite?", "Paste the invite the server's owner sent you, and you're in.") {
+        Button(onClick = onAdd) { Text("Paste invite") }
     }
-    Step(2, "Add their server", "Once they've added you, they'll send you a server code.") {
-        Button(onClick = onAdd) { Text("Add server code") }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("No invite?", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Send your device code to the person who runs the server. Once they've added you, add their " +
+                    "server code with the button above.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedButton(onClick = { shareDeviceCode(ctx, clientId) }, enabled = clientId.isNotEmpty()) {
+                Text("Share device code")
+            }
+        }
     }
 }
 
@@ -370,7 +384,7 @@ private fun Status(
 /** One server's services, or why they aren't shown. */
 @Composable
 private fun ServerServices(
-    server: Server,
+    label: String,
     services: List<Svc>?,
     loading: Boolean,
     error: String?,
@@ -386,7 +400,7 @@ private fun ServerServices(
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                server.label,
+                label,
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.weight(1f),
@@ -575,7 +589,14 @@ private fun Problem(message: String, details: String, onRetry: () -> Unit) {
 
 /** Servers and this device's code, below the everyday stuff. */
 @Composable
-private fun Manage(servers: List<Server>, clientId: String, running: Boolean, onAdd: () -> Unit, onRemove: (Server) -> Unit) {
+private fun Manage(
+    servers: List<Server>,
+    advertised: Map<String, String>,
+    clientId: String,
+    running: Boolean,
+    onAdd: () -> Unit,
+    onRemove: (Server) -> Unit,
+) {
     val ctx = LocalContext.current
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("Servers", style = MaterialTheme.typography.titleMedium)
@@ -584,7 +605,7 @@ private fun Manage(servers: List<Server>, clientId: String, running: Boolean, on
                 if (i > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp))
                 Row(Modifier.padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text(srv.label)
+                        Text(srv.label(advertised[srv.id]))
                         Text(
                             srv.id,
                             fontFamily = FontFamily.Monospace,
@@ -609,50 +630,88 @@ private fun Manage(servers: List<Server>, clientId: String, running: Boolean, on
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        Text("Stay connected", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 12.dp))
+        Text(
+            "To connect automatically, even after a restart, turn on \"Always-on VPN\" for iroh proxy " +
+                "in Android's VPN settings. (Leave \"Block connections without VPN\" off.)",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedButton(onClick = {
+            runCatching { ctx.startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS)) }
+        }) { Text("Open VPN settings") }
     }
 }
 
 @Composable
 private fun AddServer(existing: Set<String>, onDismiss: () -> Unit, onAdd: (Server) -> Unit) {
     val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
     var text by remember { mutableStateOf("") }
     var name by remember { mutableStateOf("") }
-    val code = SERVER_CODE.find(text)?.value?.lowercase()
-    val problem = when {
+    var joining by remember { mutableStateOf(false) }
+    var failed by remember { mutableStateOf<String?>(null) }
+    val invite = Invite.server(text)
+    val code = invite ?: SERVER_CODE.find(text)?.value?.lowercase()
+    val problem = failed ?: when {
         text.isBlank() -> null
-        code == null -> "That doesn't look like a server code. It's a long run of letters and numbers."
+        code == null -> "That doesn't look like an invite or a server code. It's a long run of letters and numbers."
         code in existing -> "You've already added this server."
         else -> null
     }
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!joining) onDismiss() },
         title = { Text("Add a server") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("Paste the server code you were sent. You can paste the whole message.")
+                Text("Paste the invite (or server code) you were sent. You can paste the whole message.")
                 OutlinedTextField(
                     value = text,
-                    onValueChange = { text = it },
-                    label = { Text("Server code") },
+                    onValueChange = { text = it; failed = null },
+                    label = { Text("Invite or server code") },
                     isError = problem != null,
                     supportingText = problem?.let { { Text(it) } },
                     maxLines = 3,
+                    enabled = !joining,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                TextButton(onClick = { text = paste(ctx) }) { Text("Paste") }
+                TextButton(onClick = { text = paste(ctx); failed = null }, enabled = !joining) { Text("Paste") }
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
                     label = { Text("Name it (optional), e.g. Home") },
                     singleLine = true,
+                    enabled = !joining,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                if (joining) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Text("Joining…")
+                    }
+                }
             }
         },
         confirmButton = {
-            Button(onClick = { onAdd(Server(code!!, name.trim())) }, enabled = code != null && problem == null) { Text("Add") }
+            Button(
+                onClick = {
+                    if (invite == null) {
+                        onAdd(Server(code!!, name.trim()))
+                        return@Button
+                    }
+                    joining = true
+                    scope.launch {
+                        val keyPath = Prefs(ctx).keyPath
+                        val r = withContext(Dispatchers.IO) { runCatching { Native.redeem(keyPath, text) } }
+                        joining = false
+                        r.onSuccess { onAdd(Server(it, name.trim())) }
+                            .onFailure { failed = it.message ?: "Couldn't join. Check your connection and try again." }
+                    }
+                },
+                enabled = code != null && problem == null && !joining,
+            ) { Text(if (invite != null) "Join" else "Add") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !joining) { Text("Cancel") } },
     )
 }
 
