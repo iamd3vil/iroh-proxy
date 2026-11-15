@@ -1,9 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use iroh_proxy::{Client, PeerId, RelayUrl, load_or_create_key};
+use iroh_proxy::{Client, PeerId, RelayUrl, Service, load_or_create_key};
 use serde::Deserialize;
-use tokio::net::{TcpListener, UdpSocket};
 
 #[derive(Deserialize)]
 struct ServerConfig {
@@ -23,7 +22,8 @@ struct ClientConfig {
     key_file: String,
     relay: Option<RelayUrl>,
     server: PeerId,
-    /// service name -> local "host:port" to listen on.
+    /// Every service the server offers is forwarded on 127.0.0.1:<its port> (or a random port if
+    /// that is taken). These override the local "host:port" per service name.
     #[serde(default)]
     forwards: HashMap<String, String>,
     #[serde(default)]
@@ -50,15 +50,24 @@ async fn main() -> Result<()> {
             let cfg: ClientConfig = load(path)?;
             let client = Client::new(load_or_create_key(&cfg.key_file)?, cfg.server, cfg.relay).await?;
             println!("client id: {} (add to server's `allowed`)", client.id());
-            for (service, local) in cfg.forwards {
-                let listener = TcpListener::bind(&local).await.with_context(|| format!("binding {local}"))?;
-                println!("{local} -> {service}");
-                tokio::spawn(client.clone().forward(service, listener));
+            let mut services = client.services().await.unwrap_or_else(|e| {
+                eprintln!("service discovery failed ({e:#}); forwarding configured services only");
+                vec![]
+            });
+            // Configured forwards the server didn't advertise (e.g. an older server) still count.
+            let configured = (cfg.forwards.keys().map(|n| (n, false))).chain(cfg.udp_forwards.keys().map(|n| (n, true)));
+            for (name, udp) in configured {
+                if !services.iter().any(|s| s.name == *name && s.udp == udp) {
+                    services.push(Service { name: name.clone(), udp, port: 0 });
+                }
             }
-            for (service, local) in cfg.udp_forwards {
-                let sock = UdpSocket::bind(&local).await.with_context(|| format!("binding udp {local}"))?;
-                println!("udp {local} -> {service}");
-                tokio::spawn(client.clone().forward_udp(service, sock));
+            for svc in &services {
+                let addr = if svc.udp { &cfg.udp_forwards } else { &cfg.forwards }.get(&svc.name);
+                let proto = if svc.udp { "udp" } else { "tcp" };
+                match client.expose(svc, addr.map(String::as_str)).await {
+                    Ok(local) => println!("{proto} {local} -> {}", svc.name),
+                    Err(e) => eprintln!("{proto} {}: {e:#}", svc.name),
+                }
             }
             tokio::signal::ctrl_c().await?;
         }

@@ -1,6 +1,8 @@
 //! Expose named TCP services from one iroh endpoint to an allowlist of peers.
 //!
 //! TCP: per QUIC bi-stream, `u8 len` + service name, then raw bytes both ways.
+//! Discovery: a bi-stream with an empty name gets back one `tcp|udp <port> <name>\n` line per
+//! service, where port is the target's port (a suggested local port), then EOF.
 //! UDP: one QUIC datagram per UDP packet. Client -> server: `u32 flow` + `u8 len` + service name +
 //! payload; server -> client: `u32 flow` + payload. A flow is one client-side source address.
 
@@ -36,6 +38,39 @@ pub const ALPN: &[u8] = b"iroh-proxy/0";
 /// A UDP flow is dropped after this long idle (server: no reply from the target; client: nothing
 /// sent), like a NAT mapping. Short so per-query flows (DNS) don't pile up sockets.
 const UDP_IDLE: Duration = Duration::from_secs(30);
+
+/// A service the server offers, as returned by [`Client::services`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Service {
+    pub name: String,
+    pub udp: bool,
+    /// The target's port on the server side; used as the default local port.
+    pub port: u16,
+}
+
+fn listing(tcp: &HashMap<String, String>, udp: &HashMap<String, String>) -> String {
+    let port = |t: &String| t.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(0);
+    let mut lines: Vec<String> = (tcp.iter().map(|(n, t)| format!("tcp {} {n}\n", port(t))))
+        .chain(udp.iter().map(|(n, t)| format!("udp {} {n}\n", port(t))))
+        .collect();
+    lines.sort();
+    lines.concat()
+}
+
+/// Parses `tcp|udp <port> <name>` lines (the discovery listing format); skips malformed lines.
+pub fn parse_services(s: &str) -> Vec<Service> {
+    s.lines()
+        .filter_map(|l| {
+            let mut it = l.splitn(3, ' ');
+            let udp = match it.next()? {
+                "tcp" => false,
+                "udp" => true,
+                _ => return None,
+            };
+            Some(Service { udp, port: it.next()?.parse().ok()?, name: it.next()?.to_owned() })
+        })
+        .collect()
+}
 
 /// Loads a 32-byte secret key from `path`, creating it (mode 0600) if missing.
 pub fn load_or_create_key(path: impl AsRef<Path>) -> Result<SecretKey> {
@@ -107,9 +142,9 @@ impl ProtocolHandler for Proxy {
         log_paths(conn.clone());
         tokio::spawn(serve_datagrams(conn.clone(), self.udp.clone()));
         while let Ok((send, recv)) = conn.accept_bi().await {
-            let services = self.services.clone();
+            let this = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_stream(&services, send, recv).await {
+                if let Err(e) = this.serve_stream(send, recv).await {
                     eprintln!("{peer}: {e:#}");
                 }
             });
@@ -119,14 +154,22 @@ impl ProtocolHandler for Proxy {
     }
 }
 
-async fn serve_stream(services: &HashMap<String, String>, send: SendStream, mut recv: RecvStream) -> Result<()> {
-    let mut name = vec![0; recv.read_u8().await? as usize];
-    recv.read_exact(&mut name).await?;
-    let name = String::from_utf8(name)?;
-    let Some(target) = services.get(&name) else { bail!("unknown service {name:?}") };
-    let mut tcp = TcpStream::connect(target).await.with_context(|| format!("{name} -> {target}"))?;
-    copy_bidirectional(&mut join(recv, send), &mut tcp).await?;
-    Ok(())
+impl Proxy {
+    async fn serve_stream(&self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
+        let mut name = vec![0; recv.read_u8().await? as usize];
+        if name.is_empty() {
+            send.write_all(listing(&self.services, &self.udp).as_bytes()).await?;
+            send.finish()?;
+            send.stopped().await?;
+            return Ok(());
+        }
+        recv.read_exact(&mut name).await?;
+        let name = String::from_utf8(name)?;
+        let Some(target) = self.services.get(&name) else { bail!("unknown service {name:?}") };
+        let mut tcp = TcpStream::connect(target).await.with_context(|| format!("{name} -> {target}"))?;
+        copy_bidirectional(&mut join(recv, send), &mut tcp).await?;
+        Ok(())
+    }
 }
 
 type ServerFlows = Arc<std::sync::Mutex<HashMap<u32, Arc<UdpSocket>>>>;
@@ -235,6 +278,49 @@ impl Client {
             // A failed open marks the connection closed, so this reconnects.
             Err(_) => Ok(self.conn().await?.open_bi().await?),
         }
+    }
+
+    /// Asks the server which services it offers.
+    pub async fn services(&self) -> Result<Vec<Service>> {
+        let (mut send, mut recv) = self.open().await?;
+        send.write_u8(0).await?;
+        send.finish()?;
+        let list = recv.read_to_end(64 * 1024).await.context("listing services")?;
+        Ok(parse_services(&String::from_utf8_lossy(&list)))
+    }
+
+    /// Listens on `addr` and forwards it to `svc` in the background; returns the bound address.
+    /// With no `addr`, uses `127.0.0.1:<svc.port>`, or a random port if that one is taken or
+    /// privileged (e.g. below 1024 on Android).
+    pub async fn expose(self: &Arc<Self>, svc: &Service, addr: Option<&str>) -> Result<SocketAddr> {
+        let default = format!("127.0.0.1:{}", svc.port);
+        let addrs = match addr {
+            Some(a) => vec![a],
+            None => vec![default.as_str(), "127.0.0.1:0"],
+        };
+        let mut err = None;
+        for a in addrs {
+            if svc.udp {
+                match UdpSocket::bind(a).await {
+                    Ok(s) => {
+                        let local = s.local_addr()?;
+                        tokio::spawn(self.clone().forward_udp(svc.name.clone(), s));
+                        return Ok(local);
+                    }
+                    Err(e) => err = Some(anyhow::Error::from(e).context(format!("binding udp {a}"))),
+                }
+            } else {
+                match TcpListener::bind(a).await {
+                    Ok(l) => {
+                        let local = l.local_addr()?;
+                        tokio::spawn(self.clone().forward(svc.name.clone(), l));
+                        return Ok(local);
+                    }
+                    Err(e) => err = Some(anyhow::Error::from(e).context(format!("binding {a}"))),
+                }
+            }
+        }
+        Err(err.unwrap())
     }
 
     /// Accepts TCP connections on `listener` forever, piping each to `service` on the server.

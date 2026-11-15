@@ -1,7 +1,7 @@
 // Needs internet: peers find each other via n0 DNS/relays, like in real use.
 use std::{collections::HashMap, time::Duration};
 
-use iroh_proxy::{Client, Key, serve};
+use iroh_proxy::{Client, Key, Service, serve};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -66,17 +66,35 @@ async fn roundtrip(client: std::sync::Arc<Client>, service: &str) -> std::io::Re
 #[tokio::test(flavor = "multi_thread")]
 async fn allowed_peer_reaches_service_and_stranger_does_not() {
     let (server_key, good, bad) = (Key::generate(), Key::generate(), Key::generate());
-    let services = HashMap::from([("echo".to_string(), echo_server().await)]);
-    let udp = HashMap::from([("echo".to_string(), udp_echo_server().await)]);
+    let (tcp_addr, udp_addr) = (echo_server().await, udp_echo_server().await);
+    let port = |a: &str| a.rsplit_once(':').unwrap().1.parse::<u16>().unwrap();
+    let (tcp_port, udp_port) = (port(&tcp_addr), port(&udp_addr));
+    let services = HashMap::from([("echo".to_string(), tcp_addr)]);
+    let udp = HashMap::from([("echo".to_string(), udp_addr)]);
     let router = serve(server_key.clone(), None, services, udp, [good.public()].into()).await.unwrap();
     router.endpoint().online().await;
 
     let ok = Client::new(good, server_key.public(), None).await.unwrap();
     assert_eq!(roundtrip(ok.clone(), "echo").await.unwrap(), b"hello");
     assert!(roundtrip(ok.clone(), "nope").await.is_err(), "unknown service must not connect");
-    assert_eq!(udp_roundtrip(ok, "echo").await.as_deref(), Some(&b"ping"[..]));
+    assert_eq!(udp_roundtrip(ok.clone(), "echo").await.as_deref(), Some(&b"ping"[..]));
+
+    let found = ok.services().await.unwrap();
+    assert_eq!(found, [
+        Service { name: "echo".into(), udp: false, port: tcp_port },
+        Service { name: "echo".into(), udp: true, port: udp_port },
+    ]);
+    // The echo server already holds its own port, so expose must fall back to a random one.
+    let local = ok.expose(&found[0], None).await.unwrap();
+    assert_ne!(local.port(), tcp_port);
+    let mut s = TcpStream::connect(local).await.unwrap();
+    s.write_all(b"hi").await.unwrap();
+    let mut buf = [0; 2];
+    timeout(Duration::from_secs(20), s.read_exact(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(&buf, b"hi");
 
     let stranger = Client::new(bad, server_key.public(), None).await.unwrap();
+    assert!(stranger.services().await.is_err(), "non-allowlisted peer must not list services");
     assert!(roundtrip(stranger.clone(), "echo").await.is_err(), "non-allowlisted peer must be rejected");
     assert_eq!(udp_roundtrip(stranger, "echo").await, None, "non-allowlisted peer must not get udp");
 }
