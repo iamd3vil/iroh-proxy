@@ -5,10 +5,13 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -95,6 +98,13 @@ fun App() {
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val running = ProxyService.State.running
+    var pendingSpec by remember { mutableStateOf<String?>(null) }
+    val vpnConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        val spec = pendingSpec
+        pendingSpec = null
+        if (r.resultCode == android.app.Activity.RESULT_OK && spec != null) ProxyService.start(ctx, spec)
+        else error = "VPN permission is needed to reach services by name."
+    }
 
     fun refresh() {
         if (prefs.server.isBlank()) return
@@ -193,12 +203,18 @@ fun App() {
                 Button(
                     onClick = {
                         val chosen = services.filter { enabled[it.key] ?: true }
-                        val spec = chosen.joinToString("\n") { s ->
+                        val spec = chosen.joinToString("") { s ->
                             val port = ports[s.key]?.toIntOrNull()?.takeIf { it in 0..65535 } ?: s.port
                             prefs.setPort(s, port)
-                            s.line(port)
+                            s.lines(port)
                         }
-                        ProxyService.start(ctx, spec)
+                        val consent = if (chosen.any { it.needsVpn }) VpnService.prepare(ctx) else null
+                        if (consent != null) {
+                            pendingSpec = spec
+                            vpnConsent.launch(consent)
+                        } else {
+                            ProxyService.start(ctx, spec)
+                        }
                     },
                     enabled = services.any { enabled[it.key] ?: true },
                     modifier = Modifier.fillMaxWidth(),
@@ -222,6 +238,13 @@ private fun ServiceRow(
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Column(Modifier.weight(1f)) {
             Text(svc.name, style = MaterialTheme.typography.titleMedium)
+            if (svc.needsVpn) {
+                Text(
+                    svc.hostnames.joinToString(", ") + if (running && enabled) " (VPN)" else "",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
             when {
                 !running -> Text(if (svc.udp) "UDP" else "TCP", style = MaterialTheme.typography.bodySmall)
                 !enabled -> Text("off", style = MaterialTheme.typography.bodySmall)

@@ -4,45 +4,56 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.net.VpnService
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
-/** Keeps the process (and so the forwards) alive while the user is connected. */
-class ProxyService : Service() {
+/** Keeps the process (and so the forwards) alive while the user is connected, and runs the VPN
+ *  that makes services reachable by hostname. */
+class ProxyService : VpnService() {
     /** Observed by the UI. Only written on the main thread. */
     object State {
         var running by mutableStateOf(false)
         /** Service key ("tcp name") -> local address, or null if it could not be bound. */
         var forwards by mutableStateOf<Map<String, String?>>(emptyMap())
         var error by mutableStateOf<String?>(null)
+        var vpn by mutableStateOf(false)
     }
 
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var stopped = false
-
-    override fun onBind(intent: Intent?) = null
+    private var dnsWatch: ConnectivityManager.NetworkCallback? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val spec = intent?.getStringExtra(EXTRA_SPEC)
         if (intent?.action == ACTION_STOP || spec == null) {
-            stopSelf()
+            shutdown()
             return START_NOT_STICKY
         }
+        stopped = false
         Native.init(applicationContext)
         startForeground(notification("Connecting…"))
         State.error = null
         val prefs = Prefs(this)
+        val vpn = Svc.parse(spec).any { it.needsVpn }
         worker.execute {
-            val result = runCatching { Native.start(prefs.keyPath, prefs.server, spec) }
+            val result = runCatching {
+                Native.start(prefs.keyPath, prefs.server, spec).also { if (vpn) startVpn() }
+            }
             main.post {
                 if (stopped) return@post
                 result.onSuccess { out ->
@@ -51,23 +62,71 @@ class ProxyService : Service() {
                         "$proto $name" to addr.takeIf { it != "-" }
                     }
                     State.running = true
+                    State.vpn = vpn
                     val n = State.forwards.values.count { it != null }
-                    getSystemService(NotificationManager::class.java)
-                        .notify(NOTIFICATION, notification("Forwarding $n service${if (n == 1) "" else "s"}"))
+                    val text = "Forwarding $n service${if (n == 1) "" else "s"}${if (vpn) " · VPN on" else ""}"
+                    getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(text))
                 }.onFailure {
                     State.error = it.message
-                    stopSelf()
+                    shutdown()
                 }
             }
         }
         return START_NOT_STICKY
     }
 
-    override fun onDestroy() {
+    /** The user turned the VPN off in system settings, or another VPN took over. */
+    override fun onRevoke() = shutdown()
+
+    override fun onDestroy() = shutdown()
+
+    /** Closes everything. The system stays bound to a VPN service while its interface is open, so
+     *  stopping it isn't enough: the interface must be closed (by Native.stop) first. */
+    private fun shutdown() {
+        if (stopped) return
         stopped = true
         State.running = false
+        State.vpn = false
         State.forwards = emptyMap()
-        worker.execute { Native.stop() }
+        dnsWatch?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
+        dnsWatch = null
+        worker.execute { Native.stop() } // closes the VPN interface too
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    /** Routes only the VPN range through us; we are the phone's DNS (see android/native/src/vpn.rs). */
+    private fun startVpn() {
+        // DNS servers of every real (non-VPN) network; the forwarder asks them all and takes the
+        // first answer, so ones unreachable from the current route don't matter.
+        val servers = ConcurrentHashMap<Network, List<String>>()
+        fun push() = Native.setDns(servers.values.flatten().distinct().joinToString("\n"))
+        val watch = object : ConnectivityManager.NetworkCallback() {
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                servers[network] = lp.dnsServers.mapNotNull { it.hostAddress }
+                push()
+            }
+
+            override fun onLost(network: Network) {
+                servers.remove(network)
+                push()
+            }
+        }
+        val realNetworks = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        getSystemService(ConnectivityManager::class.java).registerNetworkCallback(realNetworks, watch)
+        dnsWatch = watch
+        val tun = Builder()
+            .setSession("iroh proxy")
+            .addAddress("198.18.0.1", 16)
+            .addRoute("198.18.0.0", 16)
+            .addDnsServer("198.18.0.2")
+            .setMtu(1500)
+            .addDisallowedApplication(packageName) // iroh and forwarded DNS use the real network
+            .establish() ?: error("VPN permission was revoked")
+        Native.startVpn(tun.detachFd())
     }
 
     private fun startForeground(n: Notification) {
@@ -111,7 +170,7 @@ class ProxyService : Service() {
         }
 
         fun stop(ctx: Context) {
-            ctx.stopService(Intent(ctx, ProxyService::class.java))
+            ctx.startService(Intent(ctx, ProxyService::class.java).setAction(ACTION_STOP))
         }
     }
 }

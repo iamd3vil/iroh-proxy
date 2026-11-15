@@ -13,4 +13,6 @@ iroh = "1.4.1"
 iroh-proxy = { path = "../.." }
 # 0.21 is already in the lock file via iroh's Android dependencies.
 jni = "0.21"
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+libc = "0.2.191"
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

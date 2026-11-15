@@ -14,6 +14,29 @@ For people who just need the homelab services on their phone. The app runs the s
 A service's default port is the port it has on the server side. Ports that are taken, or below
 1024 (not allowed on Android), fall back to a random free port.
 
+## Reaching services by name (VPN mode)
+
+For services behind a reverse proxy that routes by hostname (`https://jelly.example.com`), give
+the service hostnames in `server.toml`:
+
+```toml
+[services]
+proxy = "192.168.1.10:443"
+
+[hostnames]
+proxy = ["*.example.com"]   # exact names, or *.suffix for any subdomain
+```
+
+Connect then asks for VPN permission. The VPN carries only `198.18.0.0/16`, and the app becomes
+the phone's DNS server: names matching a pattern resolve to a virtual IP that reaches the service
+on its port (443 here), so `https://jelly.example.com` works unchanged, certificate included.
+Other names are forwarded to the network's own DNS servers, and all other traffic bypasses the
+VPN. Only TCP is carried this way.
+
+Limits: Android allows one VPN at a time, and a Private DNS setting with a specific hostname
+(Settings → Network → Private DNS) bypasses the app's DNS, so names won't resolve; "Automatic"
+works.
+
 ## Build
 
 Needs the Android SDK with NDK 28.2.13676358, JDK 17 (Android Studio's bundled one works), and the
