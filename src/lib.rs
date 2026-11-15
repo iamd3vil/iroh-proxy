@@ -4,6 +4,7 @@
 //! Discovery: a bi-stream with an empty name gets back one `tcp|udp <port> <name>\n` line per
 //! service, where port is the target's port (a suggested local port), then one
 //! `host <pattern> <name>\n` line per hostname a service answers for (see [`Service::hostnames`]),
+//! then `dns <name>\n` if a TCP service is offered as clients' DNS server (see [`Service::dns`]),
 //! then EOF.
 //! UDP: one QUIC datagram per UDP packet. Client -> server: `u32 flow` + `u8 len` + service name +
 //! payload; server -> client: `u32 flow` + payload. A flow is one client-side source address.
@@ -52,9 +53,17 @@ pub struct Service {
     /// DNS names (exact, or `*.example.com` for any subdomain) that VPN-mode clients resolve to
     /// this service, so it is reachable by its usual name on [`Service::port`].
     pub hostnames: Vec<String>,
+    /// A DNS server (over TCP) that VPN-mode clients should use for names they don't answer
+    /// themselves, e.g. a filtering resolver like AdGuard Home. See [`Client::dns_query`].
+    pub dns: bool,
 }
 
-fn listing(tcp: &HashMap<String, String>, udp: &HashMap<String, String>, hosts: &HashMap<String, Vec<String>>) -> String {
+fn listing(
+    tcp: &HashMap<String, String>,
+    udp: &HashMap<String, String>,
+    hosts: &HashMap<String, Vec<String>>,
+    dns: Option<&str>,
+) -> String {
     let port = |t: &String| t.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(0);
     let mut lines: Vec<String> = (tcp.iter().map(|(n, t)| format!("tcp {} {n}\n", port(t))))
         .chain(udp.iter().map(|(n, t)| format!("udp {} {n}\n", port(t))))
@@ -63,6 +72,7 @@ fn listing(tcp: &HashMap<String, String>, udp: &HashMap<String, String>, hosts: 
     let mut host_lines: Vec<String> = hosts.iter().flat_map(|(n, hs)| hs.iter().map(move |h| format!("host {h} {n}\n"))).collect();
     host_lines.sort();
     lines.extend(host_lines);
+    lines.extend(dns.map(|d| format!("dns {d}\n")));
     lines.concat()
 }
 
@@ -70,13 +80,18 @@ fn listing(tcp: &HashMap<String, String>, udp: &HashMap<String, String>, hosts: 
 pub fn parse_services(s: &str) -> Vec<Service> {
     let mut services = Vec::new();
     let mut hosts = Vec::new();
+    let mut dns = None;
     for l in s.lines() {
+        if let Some(name) = l.strip_prefix("dns ") {
+            dns = Some(name);
+            continue;
+        }
         let mut it = l.splitn(3, ' ');
         let (Some(kind), Some(arg), Some(name)) = (it.next(), it.next(), it.next()) else { continue };
         match kind {
             "tcp" | "udp" => {
                 let Ok(port) = arg.parse() else { continue };
-                services.push(Service { name: name.to_owned(), udp: kind == "udp", port, hostnames: vec![] });
+                services.push(Service { name: name.to_owned(), udp: kind == "udp", port, hostnames: vec![], dns: false });
             }
             "host" => hosts.push((arg.to_owned(), name)),
             _ => {}
@@ -87,6 +102,9 @@ pub fn parse_services(s: &str) -> Vec<Service> {
             svc.hostnames.push(host.clone());
         }
     }
+    if let Some(svc) = services.iter_mut().find(|s| !s.udp && Some(s.name.as_str()) == dns) {
+        svc.dns = true;
+    }
     services
 }
 
@@ -96,6 +114,9 @@ pub fn service_lines(svc: &Service) -> String {
     let mut out = format!("{proto} {} {}\n", svc.port, svc.name);
     for h in &svc.hostnames {
         out += &format!("host {h} {}\n", svc.name);
+    }
+    if svc.dns {
+        out += &format!("dns {}\n", svc.name);
     }
     out
 }
@@ -158,6 +179,7 @@ struct Proxy {
     services: Arc<HashMap<String, String>>,
     udp: Arc<HashMap<String, String>>,
     hostnames: Arc<HashMap<String, Vec<String>>>,
+    dns: Option<Arc<str>>,
     allowed: Arc<HashSet<EndpointId>>,
 }
 
@@ -189,7 +211,7 @@ impl Proxy {
     async fn serve_stream(&self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
         let mut name = vec![0; recv.read_u8().await? as usize];
         if name.is_empty() {
-            send.write_all(listing(&self.services, &self.udp, &self.hostnames).as_bytes()).await?;
+            send.write_all(listing(&self.services, &self.udp, &self.hostnames, self.dns.as_deref()).as_bytes()).await?;
             send.finish()?;
             send.stopped().await?;
             return Ok(());
@@ -256,7 +278,8 @@ async fn udp_flow(conn: &Connection, udp: &HashMap<String, String>, flow: u32, n
 }
 
 /// Starts serving TCP `services` and `udp` services (name -> "host:port") to `allowed` peers.
-/// `hostnames` (service name -> DNS names) is advertised to VPN-mode clients.
+/// `hostnames` (service name -> DNS names) is advertised to VPN-mode clients, as is `dns`, a TCP
+/// service to use as their DNS server.
 /// Drop/shutdown the Router to stop.
 pub async fn serve(
     key: SecretKey,
@@ -264,8 +287,12 @@ pub async fn serve(
     services: HashMap<String, String>,
     udp: HashMap<String, String>,
     hostnames: HashMap<String, Vec<String>>,
+    dns: Option<String>,
     allowed: HashSet<EndpointId>,
 ) -> Result<Router> {
+    if let Some(d) = dns.as_ref().filter(|d| !services.contains_key(*d)) {
+        bail!("dns: no TCP service named {d:?}");
+    }
     for (name, hosts) in &hostnames {
         if !services.contains_key(name) && !udp.contains_key(name) {
             bail!("hostnames: no service named {name:?}");
@@ -278,6 +305,7 @@ pub async fn serve(
         services: Arc::new(services),
         udp: Arc::new(udp),
         hostnames: Arc::new(hostnames),
+        dns: dns.map(Into::into),
         allowed: Arc::new(allowed),
     };
     Ok(Router::builder(bind(key, relay).await?).accept(ALPN, proxy).spawn())
@@ -345,6 +373,18 @@ impl Client {
         send.write_u8(service.len() as u8).await?;
         send.write_all(service.as_bytes()).await?;
         Ok((send, recv))
+    }
+
+    /// Sends one DNS message to the TCP DNS `service` (RFC 1035 framing: a 2-byte length, then
+    /// the message) and returns the reply.
+    pub async fn dns_query(&self, service: &str, query: &[u8]) -> Result<Vec<u8>> {
+        let len = u16::try_from(query.len()).context("DNS query too long")?;
+        let (mut send, mut recv) = self.connect(service).await?;
+        send.write_all(&[&len.to_be_bytes()[..], query].concat()).await?;
+        send.finish()?;
+        let mut reply = vec![0; recv.read_u16().await? as usize];
+        recv.read_exact(&mut reply).await?;
+        Ok(reply)
     }
 
     /// Asks the server which services it offers.

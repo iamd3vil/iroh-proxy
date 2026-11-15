@@ -18,6 +18,8 @@ struct ServerConfig {
     /// service name -> DNS names (e.g. "*.example.com") VPN-mode clients resolve to it.
     #[serde(default)]
     hostnames: HashMap<String, Vec<String>>,
+    /// A TCP service (e.g. AdGuard Home on port 53) VPN-mode clients use as their DNS server.
+    dns: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -44,7 +46,7 @@ async fn main() -> Result<()> {
     match (args.get(1).map(String::as_str), args.get(2)) {
         (Some("serve"), Some(path)) => {
             let cfg: ServerConfig = load(path)?;
-            let router = iroh_proxy::serve(load_or_create_key(&cfg.key_file)?, cfg.relay, cfg.services, cfg.udp_services, cfg.hostnames, cfg.allowed).await?;
+            let router = iroh_proxy::serve(load_or_create_key(&cfg.key_file)?, cfg.relay, cfg.services, cfg.udp_services, cfg.hostnames, cfg.dns, cfg.allowed).await?;
             println!("server id: {}", router.endpoint().id());
             tokio::signal::ctrl_c().await?;
             router.shutdown().await?;
@@ -61,7 +63,7 @@ async fn main() -> Result<()> {
             let configured = (cfg.forwards.keys().map(|n| (n, false))).chain(cfg.udp_forwards.keys().map(|n| (n, true)));
             for (name, udp) in configured {
                 if !services.iter().any(|s| s.name == *name && s.udp == udp) {
-                    services.push(Service { name: name.clone(), udp, port: 0, hostnames: vec![] });
+                    services.push(Service { name: name.clone(), udp, port: 0, hostnames: vec![], dns: false });
                 }
             }
             for svc in &services {

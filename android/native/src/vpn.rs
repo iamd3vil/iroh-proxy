@@ -1,8 +1,9 @@
 //! VPN mode: services reachable by their usual hostnames (e.g. `https://jelly.example.com`).
 //!
 //! The app's VPN routes only [`NET`]. It is also the phone's DNS server ([`DNS_IP`]): names a
-//! service claims resolve to a virtual IP (one per hostname pattern), everything else is forwarded
-//! to the real network's resolvers. TCP to `virtual IP:port` is terminated here by smoltcp and
+//! service claims resolve to a virtual IP (one per hostname pattern), everything else goes to a
+//! server's DNS service through the tunnel if one is in use (e.g. AdGuard Home), otherwise (or if
+//! it doesn't answer) to the real network's resolvers. TCP to `virtual IP:port` is terminated here by smoltcp and
 //! streamed to the service with that hostname and port (on whichever server offers it); anything
 //! else is refused.
 
@@ -47,6 +48,8 @@ const FIRST_VIP: Ipv4Addr = Ipv4Addr::new(198, 18, 1, 1);
 pub const MTU: usize = 1500;
 /// Short, so stale answers don't outlive the VPN for long.
 const DNS_TTL: u32 = 30;
+/// How long to wait for the tunnel DNS before falling back to the network's.
+const TUNNEL_DNS_TIMEOUT: Duration = Duration::from_secs(4);
 const TCP_BUF: usize = 128 * 1024;
 /// A listening socket whose handshake never completed is dropped after this.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -174,11 +177,36 @@ fn servfail(query: &[u8]) -> Vec<u8> {
     r
 }
 
-/// Sends `query` to all of the real network's resolvers at once and queues the first reply for
-/// `client` (some listed servers, e.g. IPv6 ones, may not answer at all).
-async fn forward_dns(query: Vec<u8>, client: SocketAddrV4, replies: mpsc::Sender<(SocketAddrV4, Vec<u8>)>) {
+/// A server's DNS service, used for every name the VPN doesn't answer itself.
+pub type TunnelDns = (Arc<Client>, String);
+
+/// Resolves `query` for `client` and queues the reply: through the tunnel DNS if there is one,
+/// else (or if it fails) via the network's resolvers.
+async fn forward_dns(
+    query: Vec<u8>,
+    client: SocketAddrV4,
+    tunnel: Option<TunnelDns>,
+    replies: mpsc::Sender<(SocketAddrV4, Vec<u8>)>,
+) {
+    if let Some((server, service)) = tunnel {
+        match timeout(TUNNEL_DNS_TIMEOUT, server.dns_query(&service, &query)).await {
+            Ok(Ok(reply)) => {
+                _ = replies.send((client, reply)).await;
+                return;
+            }
+            Ok(Err(e)) => crate::log(&format!("dns via {service}: {e:#}; using the network's")),
+            Err(_) => crate::log(&format!("dns via {service}: timed out; using the network's")),
+        }
+    }
+    let reply = network_dns(&query).await;
+    _ = replies.send((client, reply)).await;
+}
+
+/// Asks all of the real network's resolvers at once and returns the first reply (some listed
+/// servers, e.g. IPv6 ones, may not answer at all), or SERVFAIL.
+async fn network_dns(query: &[u8]) -> Vec<u8> {
     let upstream = UPSTREAM.lock().unwrap().clone();
-    let query = Arc::new(query);
+    let query: Arc<[u8]> = query.into();
     let mut asks = tokio::task::JoinSet::new();
     for server in upstream {
         let query = query.clone();
@@ -204,14 +232,13 @@ async fn forward_dns(query: Vec<u8>, client: SocketAddrV4, replies: mpsc::Sender
         }
         None
     });
-    let reply = match first.await {
+    match first.await {
         Ok(Some(reply)) => reply,
         _ => {
             crate::log(&format!("dns: no answer from {:?}", *UPSTREAM.lock().unwrap()));
             servfail(&query)
         }
-    };
-    _ = replies.send((client, reply)).await;
+    }
 }
 
 /// An IPv4/UDP packet from `src` to `dst`. Replies too big for the MTU are truncated (TC bit),
@@ -319,7 +346,7 @@ fn sys(n: isize) -> io::Result<usize> {
 }
 
 /// Serves the TUN `fd` until it fails or the task is dropped (which closes it, ending the VPN).
-pub async fn run(fd: OwnedFd, table: Table<Arc<Client>>) -> Result<()> {
+pub async fn run(fd: OwnedFd, table: Table<Arc<Client>>, tunnel_dns: Option<TunnelDns>) -> Result<()> {
     unsafe {
         let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
         libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -376,7 +403,7 @@ pub async fn run(fd: OwnedFd, table: Table<Arc<Client>>) -> Result<()> {
                     match parse_query(query).and_then(|q| Some((table.resolve(&q.name)?, q))) {
                         Some((vip, q)) => write(&udp_packet(SocketAddrV4::new(DNS_IP, 53), client_addr, &answer(query, &q, vip))),
                         None if query.len() >= 12 => {
-                            tokio::spawn(forward_dns(query.to_vec(), client_addr, dns_tx.clone()));
+                            tokio::spawn(forward_dns(query.to_vec(), client_addr, tunnel_dns.clone(), dns_tx.clone()));
                         }
                         None => {}
                     }
@@ -526,7 +553,7 @@ mod tests {
     use super::*;
 
     fn svc(server: u8, name: &str, port: u16, hosts: &[&str]) -> (u8, Service) {
-        (server, Service { name: name.into(), udp: false, port, hostnames: hosts.iter().map(|h| h.to_string()).collect() })
+        (server, Service { name: name.into(), udp: false, port, hostnames: hosts.iter().map(|h| h.to_string()).collect(), dns: false })
     }
 
     #[test]

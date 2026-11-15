@@ -44,6 +44,27 @@ Limits: Android allows one VPN at a time, and a Private DNS setting with a speci
 (Settings → Network → Private DNS) bypasses the app's DNS, so names won't resolve; "Automatic"
 works.
 
+## Using the server's DNS (e.g. AdGuard Home)
+
+A server can offer a TCP DNS service as the phone's DNS, like Tailscale's DNS setting. Running
+`iroh-proxy serve` on the AdGuard machine:
+
+```toml
+dns = "adguard"             # top level, before any [table]
+
+[services]
+adguard = "127.0.0.1:53"    # AdGuard answers DNS over TCP on 53 by default
+```
+
+While connected, every lookup the app doesn't answer itself goes through the tunnel to that
+service (one stream per query, so large answers aren't an issue). If it doesn't answer within 4
+seconds, or the server is unreachable, the lookup falls back to the network's DNS so the phone
+keeps working (unfiltered) while the server is down. With several servers offering DNS, the first
+one in the app's list is used; the service's settings can turn it off.
+
+AdGuard sees every phone as one client (the server's address), so per-client rules and stats
+can't tell them apart.
+
 ## Build
 
 Needs the Android SDK with NDK 28.2.13676358, JDK 17 (Android Studio's bundled one works), and the

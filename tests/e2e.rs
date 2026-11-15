@@ -36,6 +36,25 @@ async fn udp_echo_server() -> String {
     addr
 }
 
+/// A stand-in DNS server over TCP: answers each length-prefixed message with "re:" + message.
+async fn dns_tcp_server() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut msg = vec![0; s.read_u16().await.unwrap() as usize];
+                s.read_exact(&mut msg).await.unwrap();
+                let reply = [&b"re:"[..], &msg].concat();
+                s.write_u16(reply.len() as u16).await.unwrap();
+                s.write_all(&reply).await.unwrap();
+            });
+        }
+    });
+    addr
+}
+
 /// Datagrams can be lost, so retry a few times.
 async fn udp_roundtrip(client: std::sync::Arc<Client>, service: &str) -> Option<Vec<u8>> {
     let fwd = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -69,10 +88,11 @@ async fn allowed_peer_reaches_service_and_stranger_does_not() {
     let (tcp_addr, udp_addr) = (echo_server().await, udp_echo_server().await);
     let port = |a: &str| a.rsplit_once(':').unwrap().1.parse::<u16>().unwrap();
     let (tcp_port, udp_port) = (port(&tcp_addr), port(&udp_addr));
-    let services = HashMap::from([("echo".to_string(), tcp_addr)]);
+    let services = HashMap::from([("echo".to_string(), tcp_addr), ("dns".to_string(), dns_tcp_server().await)]);
     let udp = HashMap::from([("echo".to_string(), udp_addr)]);
     let hostnames = HashMap::from([("echo".to_string(), vec!["*.echo.test".to_string()])]);
-    let router = serve(server_key.clone(), None, services, udp, hostnames, [good.public()].into()).await.unwrap();
+    let router =
+        serve(server_key.clone(), None, services, udp, hostnames, Some("dns".into()), [good.public()].into()).await.unwrap();
     router.endpoint().online().await;
 
     let ok = Client::new(good, server_key.public(), None).await.unwrap();
@@ -81,12 +101,15 @@ async fn allowed_peer_reaches_service_and_stranger_does_not() {
     assert_eq!(udp_roundtrip(ok.clone(), "echo").await.as_deref(), Some(&b"ping"[..]));
 
     let found = ok.services().await.unwrap();
-    assert_eq!(found, [
-        Service { name: "echo".into(), udp: false, port: tcp_port, hostnames: vec!["*.echo.test".into()] },
-        Service { name: "echo".into(), udp: true, port: udp_port, hostnames: vec!["*.echo.test".into()] },
-    ]);
+    let hosts = vec!["*.echo.test".to_string()];
+    let echo = Service { name: "echo".into(), udp: false, port: tcp_port, hostnames: hosts.clone(), dns: false };
+    assert!(found.contains(&echo));
+    assert!(found.contains(&Service { name: "echo".into(), udp: true, port: udp_port, hostnames: hosts, dns: false }));
+    assert!(found.iter().any(|s| s.name == "dns" && s.dns), "dns service must be advertised: {found:?}");
+    assert_eq!(found.len(), 3);
+    assert_eq!(ok.dns_query("dns", b"query").await.unwrap(), b"re:query");
     // The echo server already holds its own port, so expose must fall back to a random one.
-    let local = ok.expose(&found[0], None).await.unwrap();
+    let local = ok.expose(&echo, None).await.unwrap();
     assert_ne!(local.port(), tcp_port);
     let mut s = TcpStream::connect(local).await.unwrap();
     s.write_all(b"hi").await.unwrap();

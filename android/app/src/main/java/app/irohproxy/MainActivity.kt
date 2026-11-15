@@ -153,6 +153,8 @@ fun App() {
 
     val all = servers.flatMap { services[it.id].orEmpty() }
     val chosen = all.filter { enabled[it.key] ?: true }
+    val dns = chosen.firstOrNull { it.dns } // the first server (in list order) offering DNS handles it
+    val dnsServer = dns?.let { d -> servers.firstOrNull { it.id == d.server }?.label }
 
     fun connect() {
         error = null
@@ -191,7 +193,8 @@ fun App() {
                 canConnect = chosen.isNotEmpty(),
                 loading = loading.isNotEmpty(),
                 summary = "${chosen.size} service${if (chosen.size == 1) "" else "s"} from " +
-                    "${servers.size} server${if (servers.size == 1) "" else "s"}",
+                    "${servers.size} server${if (servers.size == 1) "" else "s"}" +
+                    (dnsServer?.let { "\nDNS through $it" } ?: ""),
                 error = state.error ?: error,
                 onToggle = { if (state.running) ProxyService.stop(ctx) else connect() },
             )
@@ -205,6 +208,7 @@ fun App() {
                     ports = ports,
                     enabled = enabled,
                     forwards = state.forwards,
+                    dnsKey = dns?.key,
                     onEnabled = { s, on -> enabled[s.key] = on; prefs.setEnabled(s, on) },
                     onRetry = { refresh(srv.id) },
                 )
@@ -364,6 +368,7 @@ private fun ServerServices(
     ports: MutableMap<String, String>,
     enabled: Map<String, Boolean>,
     forwards: Map<String, String?>,
+    dnsKey: String?,
     onEnabled: (Svc, Boolean) -> Unit,
     onRetry: () -> Unit,
 ) {
@@ -399,6 +404,7 @@ private fun ServerServices(
                         onEnabled = { onEnabled(s, it) },
                         running = running,
                         forward = forwards[s.key],
+                        dnsInUse = s.key == dnsKey,
                     )
                 }
             }
@@ -416,6 +422,7 @@ private fun ServiceRow(
     onEnabled: (Boolean) -> Unit,
     running: Boolean,
     forward: String?,
+    dnsInUse: Boolean,
 ) {
     val ctx = LocalContext.current
     var open by remember { mutableStateOf(false) }
@@ -433,7 +440,7 @@ private fun ServiceRow(
                     color = if (enabled) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    usage(svc, enabled, running, forward),
+                    usage(svc, enabled, running, forward, dnsInUse),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,
@@ -443,7 +450,7 @@ private fun ServiceRow(
             if (running && enabled) {
                 val link = link(svc, forward)
                 if (link != null) FilledTonalButton(onClick = { openLink(ctx, link) }) { Text("Open") }
-                if (link == null && forward != null && !svc.needsVpn) TextButton(onClick = { copy(ctx, forward) }) { Text("Copy") }
+                if (link == null && forward != null && !svc.needsVpn && !svc.dns) TextButton(onClick = { copy(ctx, forward) }) { Text("Copy") }
             } else if (!running) {
                 val turn by animateFloatAsState(if (open) 180f else 0f)
                 Icon(
@@ -457,7 +464,7 @@ private fun ServiceRow(
         AnimatedVisibility(open && !running) {
             Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Use this service", Modifier.weight(1f))
+                    Text(if (svc.dns) "Use it for this phone's DNS" else "Use this service", Modifier.weight(1f))
                     Switch(checked = enabled, onCheckedChange = onEnabled)
                 }
                 if (!svc.needsVpn) {
@@ -491,8 +498,11 @@ private fun ServiceRow(
 }
 
 /** One line on how to reach [svc]. */
-private fun usage(svc: Svc, enabled: Boolean, running: Boolean, forward: String?): String = when {
+private fun usage(svc: Svc, enabled: Boolean, running: Boolean, forward: String?, dnsInUse: Boolean): String = when {
     !enabled -> "Turned off"
+    svc.dns && !dnsInUse -> "Not in use: another server handles DNS"
+    svc.dns && running -> "Handles this phone's DNS (e.g. ad blocking)"
+    svc.dns -> "Will handle this phone's DNS (e.g. ad blocking)"
     svc.needsVpn -> svc.hostnames.joinToString(", ") { it.replace("*.", "any address ending in .") }
     !running -> "Ready"
     forward == null -> "Couldn't start on this phone"
@@ -501,7 +511,7 @@ private fun usage(svc: Svc, enabled: Boolean, running: Boolean, forward: String?
 
 /** A browser link for [svc], when there is one to open. */
 private fun link(svc: Svc, forward: String?): String? = when {
-    svc.udp -> null
+    svc.udp || svc.dns -> null
     svc.needsVpn -> svc.hostnames.firstOrNull { !it.startsWith("*.") }?.let { host ->
         when (svc.port) {
             443 -> "https://$host"

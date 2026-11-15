@@ -93,6 +93,9 @@ fn start(key_path: &str, spec: &str) -> Result<String> {
     let out = s.rt.block_on(async {
         let mut out = String::new();
         for (client, svc) in &s.services {
+            if svc.dns {
+                continue; // used by the VPN's DNS, not through a local port
+            }
             let local = match client.expose(svc, None).await {
                 Ok(a) => a.to_string(),
                 Err(_) => "-".into(),
@@ -112,9 +115,15 @@ fn start_vpn(fd: i32) -> Result<()> {
     let session = SESSION.lock().unwrap();
     let s = session.as_ref().context("not connected")?;
     let table = vpn::Table::new(&s.services);
-    anyhow::ensure!(!table.is_empty(), "no service has hostnames");
+    // The first server (in the user's order) offering DNS handles it.
+    let dns = s.services.iter().find(|(_, svc)| svc.dns).map(|(c, svc)| (c.clone(), svc.name.clone()));
+    anyhow::ensure!(!table.is_empty() || dns.is_some(), "no service has hostnames or DNS");
+    if let Some((client, _)) = &dns {
+        let client = client.clone();
+        s.rt.spawn(async move { _ = client.services().await }); // connect now, not on the first lookup
+    }
     s.rt.spawn(async move {
-        if let Err(e) = vpn::run(fd, table).await {
+        if let Err(e) = vpn::run(fd, table, dns).await {
             log(&format!("vpn: {e:#}"));
         }
     });

@@ -36,22 +36,24 @@ data class Server(val id: String, val name: String) {
 }
 
 /** A service offered by [server]; [port] is its suggested local port. [hostnames] are reached
- *  through the VPN. */
+ *  through the VPN; a [dns] service becomes the phone's DNS server while connected. */
 data class Svc(
     val server: String,
     val udp: Boolean,
     val port: Int,
     val name: String,
     val hostnames: List<String> = emptyList(),
+    val dns: Boolean = false,
 ) {
     /** Unique across servers; also how [Native.start] reports this service's forward. */
     val key get() = "$server ${if (udp) "udp" else "tcp"} $name"
-    val needsVpn get() = !udp && hostnames.isNotEmpty()
+    val needsVpn get() = !udp && (hostnames.isNotEmpty() || dns)
 
     /** This service in the listing format, forwarded on local [port]. */
     fun lines(port: Int) = buildString {
         append("${if (udp) "udp" else "tcp"} $port $name\n")
         hostnames.forEach { append("host $it $name\n") }
+        if (dns) append("dns $name\n")
     }
 
     companion object {
@@ -60,11 +62,17 @@ data class Svc(
             (server, svcs) -> "server $server\n" + svcs.joinToString("") { it.lines(port(it)) }
         }
 
-        /** Parses [server]'s listing: `tcp|udp <port> <name>` and `host <pattern> <name>` lines. */
+        /** Parses [server]'s listing: `tcp|udp <port> <name>`, `host <pattern> <name>` and
+         *  `dns <name>` lines. */
         fun parse(text: String, server: String): List<Svc> {
             val svcs = mutableListOf<Svc>()
             val hosts = mutableListOf<Pair<String, String>>()
+            var dns: String? = null
             for (l in text.lines()) {
+                if (l.startsWith("dns ")) {
+                    dns = l.removePrefix("dns ")
+                    continue
+                }
                 val p = l.split(' ', limit = 3)
                 if (p.size != 3) continue
                 when (p[0]) {
@@ -72,7 +80,9 @@ data class Svc(
                     "host" -> hosts += p[1] to p[2]
                 }
             }
-            return svcs.map { s -> s.copy(hostnames = hosts.filter { it.second == s.name }.map { it.first }) }
+            return svcs.map { s ->
+                s.copy(hostnames = hosts.filter { it.second == s.name }.map { it.first }, dns = !s.udp && s.name == dns)
+            }
         }
     }
 }
