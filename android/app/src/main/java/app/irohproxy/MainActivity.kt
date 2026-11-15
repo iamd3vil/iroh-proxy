@@ -156,7 +156,10 @@ fun App() {
     }
 
     val all = servers.flatMap { services[it.id].orEmpty() }
-    val chosen = all.filter { enabled[it.key] ?: true }
+    // A UDP service next to a TCP one of the same name (e.g. HTTP/3 for a web proxy) isn't shown
+    // separately; it follows the TCP one's switch.
+    val twinOf = { s: Svc -> if (s.udp) all.firstOrNull { !it.udp && it.server == s.server && it.name == s.name } else null }
+    val chosen = all.filter { enabled[(twinOf(it) ?: it).key] ?: true }
     val dns = chosen.firstOrNull { it.dns } // the first server (in list order) offering DNS handles it
     val dnsServer = dns?.let { d -> servers.firstOrNull { it.id == d.server }?.label(advertised[d.server]) }
 
@@ -203,7 +206,7 @@ fun App() {
                 connecting = state.connecting,
                 canConnect = chosen.isNotEmpty(),
                 loading = loading.isNotEmpty(),
-                summary = "${chosen.size} service${if (chosen.size == 1) "" else "s"} from " +
+                summary = "${chosen.count { twinOf(it) == null }} service${if (chosen.count { twinOf(it) == null } == 1) "" else "s"} from " +
                     "${servers.size} server${if (servers.size == 1) "" else "s"}" +
                     (dnsServer?.let { "\nDNS through $it" } ?: ""),
                 error = state.error ?: error,
@@ -212,7 +215,7 @@ fun App() {
             for (srv in servers) {
                 ServerServices(
                     label = srv.label(advertised[srv.id]),
-                    services = services[srv.id],
+                    services = services[srv.id]?.filter { twinOf(it) == null },
                     loading = loading[srv.id] == true,
                     error = errors[srv.id],
                     running = state.running,

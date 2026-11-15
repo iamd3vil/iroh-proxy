@@ -3,9 +3,10 @@
 //! The app's VPN routes only [`NET`]. It is also the phone's DNS server ([`DNS_IP`]): names a
 //! service claims resolve to a virtual IP (one per hostname pattern), everything else goes to a
 //! server's DNS service through the tunnel if one is in use (e.g. AdGuard Home), otherwise (or if
-//! it doesn't answer) to the real network's resolvers. TCP to `virtual IP:port` is terminated here by smoltcp and
-//! streamed to the service with that hostname and port (on whichever server offers it); anything
-//! else is refused.
+//! it doesn't answer) to the real network's resolvers. TCP to `virtual IP:port` is terminated here
+//! by smoltcp and streamed to the service with that hostname and port (on whichever server offers
+//! it); UDP to it (e.g. HTTP/3) is carried as datagrams to the UDP service of that name and port;
+//! anything else is refused.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -51,6 +52,8 @@ pub const MTU: usize = 1500;
 const TCP_BUF: usize = 128 * 1024;
 /// A listening socket whose handshake never completed is dropped after this.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A UDP flow with no packets from the phone for this long is dropped.
+const UDP_FLOW_IDLE: Duration = Duration::from_secs(60);
 
 /// The real network's DNS servers, for names that aren't ours. Set from the Android side.
 static UPSTREAM: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
@@ -68,28 +71,32 @@ pub fn set_upstream(mut servers: Vec<SocketAddr>) {
 pub struct Table<T> {
     names: Names,
     ports: HashMap<SocketAddrV4, (T, String)>,
+    udp_ports: HashMap<SocketAddrV4, (T, String)>,
 }
 
 impl<T: Clone> Table<T> {
-    /// From the TCP services' hostnames; UDP isn't routed in VPN mode. When services (e.g. on two
-    /// servers) claim the same name and port, the first one listed wins.
+    /// From the services' hostnames. When services (e.g. on two servers) claim the same name,
+    /// protocol and port, the first one listed wins.
     pub fn new(services: &[(T, Service)]) -> Self {
-        let tcp = || services.iter().filter(|(_, s)| !s.udp);
-        let mut patterns: Vec<String> = tcp().flat_map(|(_, s)| s.hostnames.iter().map(|h| h.trim_end_matches('.').to_ascii_lowercase())).collect();
+        let mut patterns: Vec<String> = services
+            .iter()
+            .flat_map(|(_, s)| s.hostnames.iter().map(|h| h.trim_end_matches('.').to_ascii_lowercase()))
+            .collect();
         patterns.sort();
         patterns.dedup();
         let mut names = Names::default();
         for (i, p) in patterns.iter().enumerate() {
             names.insert(p, Ipv4Addr::from(u32::from(FIRST_VIP) + i as u32));
         }
-        let mut ports = HashMap::new();
-        for (target, svc) in tcp() {
+        let (mut ports, mut udp_ports) = (HashMap::new(), HashMap::new());
+        for (target, svc) in services {
             for h in &svc.hostnames {
                 let vip = names.get(h).unwrap();
-                ports.entry(SocketAddrV4::new(vip, svc.port)).or_insert_with(|| (target.clone(), svc.name.clone()));
+                let map = if svc.udp { &mut udp_ports } else { &mut ports };
+                map.entry(SocketAddrV4::new(vip, svc.port)).or_insert_with(|| (target.clone(), svc.name.clone()));
             }
         }
-        Self { names, ports }
+        Self { names, ports, udp_ports }
     }
 
     #[cfg(test)]
@@ -98,19 +105,45 @@ impl<T: Clone> Table<T> {
     }
 }
 
+/// A UDP packet for the phone: from, to, payload.
+type UdpOut = (SocketAddrV4, SocketAddrV4, Vec<u8>);
+
 /// Answers `query` from `client` (names locally, the rest via [`dns::forward`]) and queues the
 /// reply, truncated if it wouldn't fit the TUN's MTU.
-async fn answer_dns(
-    query: Vec<u8>,
-    client: SocketAddrV4,
-    names: Arc<Names>,
-    tunnel: Option<TunnelDns>,
-    replies: mpsc::Sender<(SocketAddrV4, Vec<u8>)>,
-) {
+async fn answer_dns(query: Vec<u8>, client: SocketAddrV4, names: Arc<Names>, tunnel: Option<TunnelDns>, out: mpsc::Sender<UdpOut>) {
     let upstream = UPSTREAM.lock().unwrap().clone();
     let Some(reply) = dns::resolve(&query, &names, tunnel.as_ref(), &upstream, |w| crate::log(&w)).await else { return };
     let reply = if 20 + 8 + reply.len() > MTU { dns::truncated(&reply) } else { reply };
-    _ = replies.send((client, reply)).await;
+    _ = out.send((SocketAddrV4::new(DNS_IP, 53), client, reply)).await;
+}
+
+/// One phone-side UDP flow (phone address -> virtual IP:port) to a UDP service.
+struct UdpConn {
+    to_service: mpsc::Sender<Vec<u8>>,
+    last: Instant,
+}
+
+/// Starts carrying the flow `key` to `service`: packets sent on the returned channel go to the
+/// service, its replies come back to the phone through `out`. Ends when the channel is dropped.
+fn udp_bridge(key: (SocketAddrV4, SocketAddrV4), client: &Arc<Client>, service: &str, out: mpsc::Sender<UdpOut>) -> Option<UdpConn> {
+    let (flow, mut replies) = client.udp_flow(service).ok()?;
+    let (to_service, mut packets) = mpsc::channel::<Vec<u8>>(64);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                p = packets.recv() => match p {
+                    Some(p) => _ = flow.send(&p).await, // too big for the path: dropped, like UDP
+                    None => break,
+                },
+                Some(r) = replies.recv() => {
+                    if out.send((key.1, key.0, r)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Some(UdpConn { to_service, last: Instant::now() })
 }
 
 /// A server's DNS service, used for every name the VPN doesn't answer itself.
@@ -229,7 +262,8 @@ pub async fn run(fd: OwnedFd, table: Table<Arc<Client>>, tunnel_dns: Option<Tunn
     let mut sockets = SocketSet::new(vec![]);
     let mut conns: HashMap<(SocketAddrV4, SocketAddrV4), Conn> = HashMap::new();
     let notify = Arc::new(Notify::new());
-    let (dns_tx, mut dns_rx) = mpsc::channel::<(SocketAddrV4, Vec<u8>)>(64);
+    let (udp_tx, mut udp_rx) = mpsc::channel::<UdpOut>(256);
+    let mut flows: HashMap<(SocketAddrV4, SocketAddrV4), UdpConn> = HashMap::new();
     let mut buf = vec![0u8; 65536];
     let mut incoming = Vec::new();
     let names = Arc::new(table.names.clone());
@@ -249,7 +283,12 @@ pub async fn run(fd: OwnedFd, table: Table<Arc<Client>>, tunnel_dns: Option<Tunn
                     }
                 }
             }
-            Some((dst, reply)) = dns_rx.recv() => write(&udp_packet(SocketAddrV4::new(DNS_IP, 53), dst, &reply)),
+            Some((from, to, payload)) = udp_rx.recv() => {
+                write(&udp_packet(from, to, &payload));
+                while let Ok((from, to, payload)) = udp_rx.try_recv() {
+                    write(&udp_packet(from, to, &payload));
+                }
+            }
             _ = notify.notified() => {}
             _ = sleep(delay.min(Duration::from_secs(5))) => {}
         }
@@ -264,8 +303,24 @@ pub async fn run(fd: OwnedFd, table: Table<Arc<Client>>, tunnel_dns: Option<Tunn
                         continue;
                     }
                     let client_addr = SocketAddrV4::new(src_ip, udp.src_port());
-                    tokio::spawn(answer_dns(udp.payload().to_vec(), client_addr, names.clone(), tunnel_dns.clone(), dns_tx.clone()));
+                    tokio::spawn(answer_dns(udp.payload().to_vec(), client_addr, names.clone(), tunnel_dns.clone(), udp_tx.clone()));
                     continue;
+                }
+                IpProtocol::Udp => {
+                    let Ok(udp) = UdpPacket::new_checked(ip.payload()) else { continue };
+                    let key = (SocketAddrV4::new(src_ip, udp.src_port()), SocketAddrV4::new(dst_ip, udp.dst_port()));
+                    if let Some((client, service)) = table.udp_ports.get(&key.1) {
+                        if !flows.contains_key(&key)
+                            && let Some(conn) = udp_bridge(key, client, service, udp_tx.clone())
+                        {
+                            flows.insert(key, conn);
+                        }
+                        if let Some(f) = flows.get_mut(&key) {
+                            f.last = Instant::now();
+                            _ = f.to_service.try_send(udp.payload().to_vec()); // full: dropped, like UDP
+                        }
+                        continue;
+                    }
                 }
                 IpProtocol::Tcp => {
                     if let Ok(tcp) = TcpPacket::new_checked(ip.payload()) {
@@ -287,6 +342,7 @@ pub async fn run(fd: OwnedFd, table: Table<Arc<Client>>, tunnel_dns: Option<Tunn
         iface.poll(now(), &mut dev, &mut sockets);
         pump(&mut conns, &mut sockets);
         iface.poll(now(), &mut dev, &mut sockets);
+        flows.retain(|_, f| f.last.elapsed() < UDP_FLOW_IDLE);
     }
 }
 
@@ -421,6 +477,7 @@ mod tests {
             svc(1, "proxy-http", 80, &["*.example.com"]),
             svc(2, "jf", 8096, &["JF.example.com."]),
             svc(2, "other-proxy", 443, &["*.example.com"]), // loses to server 1's
+            (1, Service { udp: true, ..svc(1, "proxy", 443, &["*.example.com"]).1 }), // HTTP/3
         ]);
         let wild = t.resolve("jelly.example.com").unwrap();
         assert_eq!(t.resolve("a.b.example.com."), Some(wild));
@@ -431,5 +488,7 @@ mod tests {
         assert_eq!(t.ports[&SocketAddrV4::new(wild, 80)], (1, "proxy-http".into()));
         assert_eq!(t.ports[&SocketAddrV4::new(t.resolve("jf.example.com").unwrap(), 8096)], (2, "jf".into()));
         assert!(!t.ports.contains_key(&SocketAddrV4::new(wild, 22)));
+        assert_eq!(t.udp_ports[&SocketAddrV4::new(wild, 443)], (1, "proxy".into()));
+        assert!(!t.udp_ports.contains_key(&SocketAddrV4::new(wild, 80)));
     }
 }

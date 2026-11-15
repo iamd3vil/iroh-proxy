@@ -106,6 +106,16 @@ async fn allowed_peer_reaches_service_and_stranger_does_not() {
     assert_eq!(roundtrip(ok.clone(), "echo").await.unwrap(), b"hello");
     assert!(roundtrip(ok.clone(), "nope").await.is_err(), "unknown service must not connect");
     assert_eq!(udp_roundtrip(ok.clone(), "echo").await.as_deref(), Some(&b"ping"[..]));
+    let (flow, mut replies) = ok.udp_flow("echo").unwrap();
+    let mut echoed = None;
+    for _ in 0..5 {
+        flow.send(b"flow").await.unwrap();
+        if let Ok(Some(r)) = timeout(Duration::from_secs(4), replies.recv()).await {
+            echoed = Some(r);
+            break;
+        }
+    }
+    assert_eq!(echoed.as_deref(), Some(&b"flow"[..]), "udp_flow round trip");
 
     let found = ok.services().await.unwrap();
     let hosts = vec!["*.echo.test".to_string()];

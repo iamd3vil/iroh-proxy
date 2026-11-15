@@ -78,7 +78,7 @@ data class Svc(
 ) {
     /** Unique across servers; also how [Native.start] reports this service's forward. */
     val key get() = "$server ${if (udp) "udp" else "tcp"} $name"
-    val needsVpn get() = !udp && (hostnames.isNotEmpty() || dns)
+    val needsVpn get() = hostnames.isNotEmpty() || (dns && !udp)
 
     /** This service in the listing format, forwarded on local [port]. */
     fun lines(port: Int) = buildString {

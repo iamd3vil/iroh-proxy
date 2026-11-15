@@ -440,7 +440,8 @@ async fn udp_flow(conn: &Connection, udp: &HashMap<String, String>, flow: u32, n
                     break;
                 }
                 // Dropped like UDP over a small MTU; the max is ~1160 bytes over a relay.
-                eprintln!("{name}: dropped {n}-byte reply: {e}");
+                let max = conn.max_datagram_size().map_or("unknown".into(), |m| (m - 4).to_string());
+                eprintln!("{name}: dropped {n}-byte reply: {e} (this path carries up to {max})");
             }
         }
         flows.lock().unwrap().remove(&flow);
@@ -478,7 +479,39 @@ pub struct PathInfo {
     pub rtt: Duration,
 }
 
-type ClientFlows = Arc<std::sync::Mutex<HashMap<u32, (Arc<UdpSocket>, SocketAddr)>>>;
+/// Where a UDP flow's replies go: back out of a local socket to the sender, or to a channel
+/// (see [`Client::udp_flow`]).
+#[derive(Clone)]
+enum FlowSink {
+    Socket(Arc<UdpSocket>, SocketAddr),
+    Channel(tokio::sync::mpsc::Sender<Vec<u8>>),
+}
+
+type ClientFlows = Arc<std::sync::Mutex<HashMap<u32, FlowSink>>>;
+
+/// One UDP flow to a service, carried as QUIC datagrams; replies arrive on the channel
+/// [`Client::udp_flow`] returns. Dropping it ends the flow (the server's side times out).
+pub struct UdpFlow {
+    client: Arc<Client>,
+    id: u32,
+    service: String,
+}
+
+impl UdpFlow {
+    /// Sends one UDP payload. Like UDP, it may be dropped: e.g. if it's bigger than a datagram
+    /// can be on the current path (about 1160 bytes through a relay).
+    pub async fn send(&self, payload: &[u8]) -> Result<()> {
+        let d = [&self.id.to_be_bytes(), &[self.service.len() as u8][..], self.service.as_bytes(), payload].concat();
+        self.client.conn().await?.send_datagram(d.into())?;
+        Ok(())
+    }
+}
+
+impl Drop for UdpFlow {
+    fn drop(&mut self) {
+        self.client.udp.lock().unwrap().remove(&self.id);
+    }
+}
 
 pub struct Client {
     ep: Endpoint,
@@ -652,6 +685,18 @@ impl Client {
         }
     }
 
+    /// A UDP flow to the UDP `service`, for callers that move packets themselves (e.g. a VPN);
+    /// replies arrive on the returned channel.
+    pub fn udp_flow(self: &Arc<Self>, service: &str) -> Result<(UdpFlow, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
+        if service.len() > u8::MAX as usize {
+            bail!("service name too long");
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let id = self.next_flow.fetch_add(1, Ordering::Relaxed);
+        self.udp.lock().unwrap().insert(id, FlowSink::Channel(tx));
+        Ok((UdpFlow { client: self.clone(), id, service: service.to_owned() }, rx))
+    }
+
     /// Relays UDP packets received on `sock` to the `service` UDP service on the server, and its
     /// replies back to each sender.
     pub async fn forward_udp(self: Arc<Self>, service: String, sock: UdpSocket) -> Result<()> {
@@ -676,7 +721,7 @@ impl Client {
             }
             let (flow, seen) = ids.entry(src).or_insert_with(|| {
                 let id = self.next_flow.fetch_add(1, Ordering::Relaxed);
-                self.udp.lock().unwrap().insert(id, (sock.clone(), src));
+                self.udp.lock().unwrap().insert(id, FlowSink::Socket(sock.clone(), src));
                 (id, now)
             });
             *seen = now;
@@ -692,9 +737,11 @@ impl Client {
 async fn recv_datagrams(conn: Connection, flows: ClientFlows) {
     while let Ok(d) = conn.read_datagram().await {
         let Some((flow, payload)) = d.split_first_chunk::<4>() else { continue };
-        let dst = flows.lock().unwrap().get(&u32::from_be_bytes(*flow)).cloned();
-        if let Some((sock, src)) = dst {
-            _ = sock.send_to(payload, src).await;
+        let sink = flows.lock().unwrap().get(&u32::from_be_bytes(*flow)).cloned();
+        match sink {
+            Some(FlowSink::Socket(sock, src)) => _ = sock.send_to(payload, src).await,
+            Some(FlowSink::Channel(tx)) => _ = tx.try_send(payload.to_vec()), // full: dropped, like UDP
+            None => {}
         }
     }
 }

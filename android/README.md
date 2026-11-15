@@ -48,6 +48,18 @@ Hostnames from all servers share one VPN; if two servers claim the same name and
 added first wins. Other names are forwarded to the network's own DNS servers, and all other traffic bypasses the
 VPN. Only TCP is carried this way.
 
+For HTTP/3, also offer the proxy's UDP port under the same name; hostnames apply to both:
+
+```toml
+[udp_services]
+proxy = "192.168.1.10:443"
+```
+
+UDP to the name's address then travels as QUIC datagrams. QUIC needs about 1200-byte packets, which
+fit on a direct path with a normal MTU but not through a relay (about 1160 bytes) or a 1280-MTU link
+(e.g. a Tailscale address); there browsers fall back to TCP on their own. The server logs what a
+path carries when it has to drop a packet.
+
 Limits: Android allows one VPN at a time, and a Private DNS setting with a specific hostname
 (Settings → Network → Private DNS) bypasses the app's DNS, so names won't resolve; "Automatic"
 works.
