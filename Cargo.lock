@@ -1301,6 +1301,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "iroh-proxy-android"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "iroh-proxy",
+ "jni 0.21.1",
+ "tokio",
+]
+
+[[package]]
 name = "iroh-relay"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

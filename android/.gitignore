@@ -1,0 +1,7 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+# Built by build-native.sh
+app/src/main/jniLibs/

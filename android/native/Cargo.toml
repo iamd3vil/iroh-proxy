@@ -1,0 +1,16 @@
+[package]
+name = "iroh-proxy-android"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.104"
+iroh = "1.4.1"
+iroh-proxy = { path = "../.." }
+# 0.21 is already in the lock file via iroh's Android dependencies.
+jni = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
