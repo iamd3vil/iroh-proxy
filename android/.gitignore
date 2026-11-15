@@ -5,3 +5,6 @@ local.properties
 *.iml
 # Built by build-native.sh
 app/src/main/jniLibs/
+# Release signing (see README); never commit
+keystore.properties
+*.jks

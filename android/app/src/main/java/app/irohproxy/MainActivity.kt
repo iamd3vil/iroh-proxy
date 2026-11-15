@@ -91,7 +91,8 @@ fun App() {
     val prefs = remember { Prefs(ctx) }
     val scope = rememberCoroutineScope()
     var clientId by remember { mutableStateOf("") }
-    var server by remember { mutableStateOf(prefs.server) }
+    var server by remember { mutableStateOf(prefs.server) } // the text field
+    var saved by remember { mutableStateOf(prefs.server) } // prefs.server, observable by Compose
     val services = remember { mutableStateListOf<Svc>() }
     val ports = remember { mutableStateMapOf<String, String>() } // port text field per service key
     val enabled = remember { mutableStateMapOf<String, Boolean>() }
@@ -165,14 +166,15 @@ fun App() {
             Button(
                 onClick = {
                     prefs.server = server
+                    saved = prefs.server
                     services.clear()
                     refresh()
                 },
                 enabled = !running && server.isNotBlank() && !loading,
-            ) { Text(if (prefs.server.isNotBlank() && server.trim() == prefs.server) "Refresh services" else "Save") }
+            ) { Text(if (saved.isNotBlank() && server.trim() == saved) "Refresh services" else "Save") }
         }
 
-        if (prefs.server.isNotBlank()) Section("Services") {
+        if (saved.isNotBlank()) Section("Services") {
             if (loading) CircularProgressIndicator(Modifier.size(24.dp))
             error?.let {
                 Text(

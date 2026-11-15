@@ -50,3 +50,18 @@ JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ./gradle
 ```
 
 Gradle runs `build-native.sh` first, which cross-compiles `native/` into `app/src/main/jniLibs/`.
+
+### Release build
+
+`./gradlew assembleRelease` gives a shrunk APK at `app/build/outputs/apk/release/app-release.apk`,
+signed with the key named in `keystore.properties` (gitignored; without it the APK is unsigned):
+
+```properties
+storeFile=/path/to/release.jks
+storePassword=...
+keyAlias=iroh-proxy
+keyPassword=...
+```
+
+Back up the keystore and its password: updates must be signed with the same key, otherwise users
+have to uninstall first, which also deletes their device key (and so changes their device ID).
