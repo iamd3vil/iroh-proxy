@@ -28,6 +28,8 @@ class ProxyService : VpnService() {
     /** Observed by the UI. Only written on the main thread. */
     object State {
         var running by mutableStateOf(false)
+        /** Between Connect and the forwards being up (or failing). */
+        var connecting by mutableStateOf(false)
         /** [Svc.key] -> local address, or null if it could not be bound. */
         var forwards by mutableStateOf<Map<String, String?>>(emptyMap())
         var error by mutableStateOf<String?>(null)
@@ -48,6 +50,7 @@ class ProxyService : VpnService() {
         Native.init(applicationContext)
         startForeground(notification("Connecting…"))
         State.error = null
+        State.connecting = true
         val prefs = Prefs(this)
         val vpn = intent.getBooleanExtra(EXTRA_VPN, false)
         worker.execute {
@@ -55,6 +58,7 @@ class ProxyService : VpnService() {
                 Native.start(prefs.keyPath, spec).also { if (vpn) startVpn() }
             }
             main.post {
+                State.connecting = false
                 if (stopped) return@post
                 result.onSuccess { out ->
                     State.forwards = out.lines().filter { it.isNotBlank() }.associate { l ->
@@ -86,6 +90,7 @@ class ProxyService : VpnService() {
         if (stopped) return
         stopped = true
         State.running = false
+        State.connecting = false
         State.vpn = false
         State.forwards = emptyMap()
         dnsWatch?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }

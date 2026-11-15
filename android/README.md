@@ -5,14 +5,17 @@ For people who just need the homelab services on their phone. The app runs the s
 
 ## Use
 
-1. Install the APK, open it, and send the **device ID** to each server's owner (it is the same for
-   every server).
-2. They add it to `allowed` in `server.toml` and restart the server.
-3. Paste a **server ID** (and optionally a name) and tap Add server; repeat for more servers. Each
-   server's services are listed automatically.
-4. Change a local port or switch a service off if you like, then tap **Connect**, which connects
-   to every server at once. Point other apps at the address shown (e.g. `127.0.0.1:8096`). A
-   notification stays up while connected.
+1. Install the APK, open it, and tap **Share device code** to send it to each server's owner (the
+   code is the same for every server).
+2. They add it to `allowed` in `server.toml`, restart the server, and send back the **server code**
+   (the server's id, printed when it starts).
+3. Tap **Add server code** and paste it; pasting their whole message works. Repeat for more
+   servers. Each server's services are listed automatically.
+4. Tap the power button to connect to every server at once. Each service shows how to reach it,
+   with **Open** (in the browser) or **Copy**. A notification stays up while connected.
+
+Tapping a service (while disconnected) shows its settings: turn it off, or pick the port it uses
+on the phone.
 
 A service's default port is the port it has on the server side. Ports that are taken, or below
 1024 (not allowed on Android), fall back to a random free port.
