@@ -7,13 +7,16 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use iroh_proxy::{
-    Client, InviteRejected, PeerId, RelayUrl, ServerConfig, Service, bind, create_invite, dns, invite_code, load_or_create_key, parse_invite,
+    Client, InviteRejected, PeerId, RelayUrl, ServerConfig, Service, bind, create_invite, de_relay, dns, invite_code, load_or_create_key,
+    parse_invite,
 };
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct ServerFile {
     key_file: String,
+    /// Preferred over n0's relays, which are used while it is down; also put in invites.
+    #[serde(default, deserialize_with = "de_relay")]
     relay: Option<RelayUrl>,
     #[serde(flatten)]
     cfg: ServerConfig,
@@ -34,6 +37,9 @@ impl ServerFile {
 #[derive(Deserialize)]
 struct ClientConfig {
     key_file: String,
+    /// Preferred over n0's relays, which are used while it is down. `join` sets it from the
+    /// invite if unset.
+    #[serde(default, deserialize_with = "de_relay")]
     relay: Option<RelayUrl>,
     /// The server to connect to; or several, with `servers`. All see the same client id.
     server: Option<PeerId>,
@@ -181,14 +187,15 @@ async fn main() -> Result<()> {
             let label = args.get(3).map_or("", String::as_str);
             let token = create_invite(f.cfg.state_dir.as_deref().unwrap(), label)?;
             let server = load_or_create_key(&f.key_file)?.public();
-            println!("{}", invite_code(server, &token));
+            println!("{}", invite_code(server, &token, f.relay.as_ref()));
             eprintln!("One-time invite{}. Paste it into the app, or run `iroh-proxy join <client.toml> <invite>`.",
                 if label.is_empty() { String::new() } else { format!(" for {label}") });
         }
         (Some("join"), Some(path)) => {
             let cfg: ClientConfig = load(path)?;
-            let (server, token) = args.get(3).and_then(|c| parse_invite(c)).context("usage: join <client.toml> <invite code>")?;
-            let client = Client::new(load_or_create_key(&cfg.key_file)?, server, cfg.relay).await?;
+            let invite = args.get(3).and_then(|c| parse_invite(c)).context("usage: join <client.toml> <invite code>")?;
+            let (server, token) = (invite.server, invite.token);
+            let client = Client::new(load_or_create_key(&cfg.key_file)?, server, cfg.relay.clone()).await?;
             // A server that just started may not be findable yet; a refused invite is final.
             let mut tries = 0;
             while let Err(e) = client.redeem(&token).await {
@@ -202,6 +209,13 @@ async fn main() -> Result<()> {
             println!("joined {server}");
             if !cfg.server.iter().chain(&cfg.servers).any(|s| *s == server) {
                 eprintln!("Add it to `servers` in {path} to connect to it.");
+            }
+            // Like the app: the server's relay, unless one is set already.
+            if let (Some(relay), None) = (invite.relay, &cfg.relay) {
+                let old = std::fs::read_to_string(path)?;
+                // At the top, since a top-level key can't come after a [table].
+                std::fs::write(path, format!("relay = \"{relay}\"\n{old}"))?;
+                println!("relay set to {relay} in {path}");
             }
         }
         (Some("connect"), Some(path)) => connect(load(path)?).await?,

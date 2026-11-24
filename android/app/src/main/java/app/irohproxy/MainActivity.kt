@@ -119,6 +119,8 @@ fun App() {
     var paths by remember { mutableStateOf<Map<String, PathInfo>>(emptyMap()) } // by server id
     var error by remember { mutableStateOf<String?>(null) }
     var adding by remember { mutableStateOf(false) }
+    var relay by remember { mutableStateOf(prefs.relay) }
+    var editingRelay by remember { mutableStateOf(false) }
     var explainVpn by remember { mutableStateOf<Intent?>(null) } // Android's consent screen, after ours
     val state = ProxyService.State
     var pending by remember { mutableStateOf<String?>(null) } // spec waiting for VPN consent
@@ -181,7 +183,10 @@ fun App() {
     }
 
     LaunchedEffect(Unit) {
-        clientId = withContext(Dispatchers.IO) { Native.clientId(prefs.keyPath) }
+        clientId = withContext(Dispatchers.IO) {
+            runCatching { Native.setRelay(prefs.relay) } // a no-op while connected: the service set it
+            Native.clientId(prefs.keyPath)
+        }
         servers.forEach { refresh(it.id) }
     }
 
@@ -233,7 +238,9 @@ fun App() {
                 advertised = advertised,
                 clientId = clientId,
                 running = state.running,
+                relay = relay,
                 onAdd = { adding = true },
+                onRelay = { editingRelay = true },
                 onRemove = { srv ->
                     saveServers(servers - srv)
                     services.remove(srv.id)
@@ -267,8 +274,22 @@ fun App() {
             onDismiss = { adding = false },
             onAdd = { srv ->
                 adding = false
+                relay = prefs.relay // an invite may have set it
                 saveServers(servers + srv)
                 refresh(srv.id)
+            },
+        )
+    }
+
+    if (editingRelay) {
+        RelayDialog(
+            current = relay,
+            onDismiss = { editingRelay = false },
+            onSave = { url ->
+                editingRelay = false
+                prefs.relay = url
+                relay = url
+                servers.forEach { refresh(it.id) } // the old session closed
             },
         )
     }
@@ -597,7 +618,9 @@ private fun Manage(
     advertised: Map<String, String>,
     clientId: String,
     running: Boolean,
+    relay: String,
     onAdd: () -> Unit,
+    onRelay: () -> Unit,
     onRemove: (Server) -> Unit,
 ) {
     val ctx = LocalContext.current
@@ -633,6 +656,14 @@ private fun Manage(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        Text("Relay", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 12.dp))
+        Text(
+            if (relay.isBlank()) "Public relays (n0), for when a direct connection isn't possible."
+            else "$relay, falling back to the public relays (n0) while it's down.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedButton(onClick = onRelay, enabled = !running) { Text("Change relay") }
         Text("Stay connected", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 12.dp))
         Text(
             "To connect automatically, even after a restart, turn on \"Always-on VPN\" for iroh proxy " +
@@ -704,8 +735,17 @@ private fun AddServer(existing: Set<String>, onDismiss: () -> Unit, onAdd: (Serv
                     }
                     joining = true
                     scope.launch {
-                        val keyPath = Prefs(ctx).keyPath
-                        val r = withContext(Dispatchers.IO) { runCatching { Native.redeem(keyPath, text) } }
+                        val prefs = Prefs(ctx)
+                        val r = withContext(Dispatchers.IO) {
+                            runCatching {
+                                val id = Native.redeem(prefs.keyPath, text)
+                                // The server's own relay, unless the user already picked one.
+                                Invite.relay(text)?.takeIf { prefs.relay.isBlank() }?.let { url ->
+                                    runCatching { Native.setRelay(url) }.onSuccess { prefs.relay = url }
+                                }
+                                id
+                            }
+                        }
                         joining = false
                         r.onSuccess { onAdd(Server(it, name.trim())) }
                             .onFailure { failed = it.message ?: "Couldn't join. Check your connection and try again." }
@@ -715,6 +755,47 @@ private fun AddServer(existing: Set<String>, onDismiss: () -> Unit, onAdd: (Serv
             ) { Text(if (invite != null) "Join" else "Add") }
         },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !joining) { Text("Cancel") } },
+    )
+}
+
+/** Edits the relay to prefer over n0's; blank for n0's only. */
+@Composable
+private fun RelayDialog(current: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    val scope = rememberCoroutineScope()
+    var text by remember { mutableStateOf(current) }
+    var failed by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Relay") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "Your own iroh relay, used when a direct connection isn't possible. While it's down, " +
+                        "the public relays (n0) are used instead. Leave empty to use only the public ones.",
+                )
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it; failed = null },
+                    label = { Text("e.g. relay.example.com") },
+                    isError = failed != null,
+                    supportingText = failed?.let { { Text(it) } },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                scope.launch {
+                    val url = text.trim()
+                    withContext(Dispatchers.IO) { runCatching { Native.setRelay(url) } }
+                        .onSuccess { onSave(url) }
+                        .onFailure { failed = it.message ?: "That isn't a valid relay address." }
+                }
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
 

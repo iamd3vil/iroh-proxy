@@ -13,7 +13,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use iroh_proxy::{Client, Endpoint, InviteRejected, PeerId, Service, bind, load_or_create_key, parse_invite, parse_services};
+use iroh_proxy::{
+    Client, Endpoint, InviteRejected, PeerId, RelayUrl, Service, bind, load_or_create_key, parse_invite, parse_relay, parse_services,
+};
 use jni::{
     JNIEnv,
     objects::{JClass, JObject, JString},
@@ -38,7 +40,8 @@ impl Session {
     fn open(key_path: &str) -> Result<Self> {
         let key = load_or_create_key(key_path)?;
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-        let ep = rt.block_on(bind(key, None))?;
+        let relay = RELAY.lock().unwrap().clone();
+        let ep = rt.block_on(async { bind(key, relay).await })?;
         Ok(Self { rt, ep, clients: HashMap::new(), services: vec![] })
     }
 
@@ -49,6 +52,20 @@ impl Session {
 }
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+
+/// The relay sessions prefer over n0's; see [`set_relay`].
+static RELAY: Mutex<Option<RelayUrl>> = Mutex::new(None);
+
+/// Sets the relay for new sessions ("" for n0's). A change closes the current session, so call it
+/// before connecting, not while connected.
+fn set_relay(url: &str) -> Result<()> {
+    let relay = if url.trim().is_empty() { None } else { Some(parse_relay(url)?) };
+    let changed = std::mem::replace(&mut *RELAY.lock().unwrap(), relay.clone()) != relay;
+    if changed {
+        close(&mut SESSION.lock().unwrap());
+    }
+    Ok(())
+}
 
 fn close(session: &mut Option<Session>) {
     if let Some(s) = session.take() {
@@ -70,7 +87,7 @@ fn services(key_path: &str, server: &str) -> Result<String> {
 
 /// Redeems the invite code in `text`; returns the server's id.
 fn redeem(key_path: &str, text: &str) -> Result<String> {
-    let (server, token) = parse_invite(text).context("no invite code found")?;
+    let iroh_proxy::Invite { server, token, .. } = parse_invite(text).context("no invite code found")?;
     let (rt, client) = {
         let mut session = SESSION.lock().unwrap();
         if session.is_none() {
@@ -263,6 +280,12 @@ pub extern "system" fn Java_app_irohproxy_Native_setDns(mut env: JNIEnv, _: JCla
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_app_irohproxy_Native_redeem(mut env: JNIEnv, _: JClass, key_path: JString, text: JString) -> jstring {
     ret(&mut env, |env| redeem(&string(env, &key_path)?, &string(env, &text)?))
+}
+
+/// Sets the relay to prefer over n0's ("" for none). Throws if `url` isn't a valid URL or host.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_irohproxy_Native_setRelay(mut env: JNIEnv, _: JClass, url: JString) -> jstring {
+    ret(&mut env, |env| set_relay(&string(env, &url)?).map(|()| String::new()))
 }
 
 /// Each connected server's path: `<server> direct|relay <ip:port or relay host> <rtt ms>` lines.

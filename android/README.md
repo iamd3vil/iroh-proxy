@@ -14,6 +14,13 @@ Without an invite: tap **Share device code** and send it to the server's owner, 
 `allowed` in `server.toml` and sends back the **server code** (the server's id, printed when it
 starts) to add with **Add server**.
 
+If the server has `relay = "https://relay.example.com"` set, its invites end in
+`@relay.example.com` and joining sets that as the app's relay (unless one is set already). Change
+it under **Relay**. `iroh-proxy join` does the same, writing `relay` into the client config. The
+`relay` setting takes a URL or just a host, here and in both config files. The app uses that relay first and switches to n0's public relays while it's
+down; it checks again after a minute, then waits longer each time it's still down, up to 30 minutes.
+Servers and the desktop client fall back the same way.
+
 Then tap the power button to connect to every server at once. Each service shows how to reach it,
 with **Open** (in the browser) or **Copy**, and each server how its connection travels (direct or
 through a relay). A server's `name = "Home"` is shown unless the user names it themselves.

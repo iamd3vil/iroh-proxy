@@ -152,15 +152,82 @@ pub fn load_or_create_key(path: impl AsRef<Path>) -> Result<SecretKey> {
 
 /// Binds an iroh endpoint with `key`, for [`Client::with_endpoint`].
 ///
-/// `relay`: your own iroh-relay instead of n0's public ones. Relayed traffic goes through the
-/// *dialed* endpoint's relay, so setting it on the server alone is enough; a client left on n0
-/// still gets QUIC address discovery from n0 for hole punching.
+/// `relay`: your own iroh-relay in preference to n0's public ones, which are only used while it
+/// is down (see [`prefer_relay`]). Relayed traffic goes through the *dialed* endpoint's relay, so
+/// setting it on the server alone is enough; a client left on n0 still gets QUIC address
+/// discovery from n0 for hole punching.
 pub async fn bind(key: SecretKey, relay: Option<RelayUrl>) -> Result<Endpoint> {
     let mut b = Endpoint::builder(presets::N0).secret_key(key);
-    if let Some(url) = relay {
-        b = b.relay_mode(RelayMode::Custom(url.into()));
+    if let Some(url) = &relay {
+        b = b.relay_mode(RelayMode::custom([url.clone()]));
     }
-    Ok(b.bind().await?)
+    let ep = b.bind().await?;
+    if let Some(url) = relay {
+        tokio::spawn(prefer_relay(ep.clone(), url));
+    }
+    Ok(ep)
+}
+
+/// A relay given as a URL, or as a host (`relay.example.com[:port]`) meaning https.
+pub fn parse_relay(s: &str) -> Result<RelayUrl> {
+    let s = s.trim();
+    let url = if s.contains("://") { s.to_owned() } else { format!("https://{s}") };
+    url.parse().with_context(|| format!("invalid relay {s:?}"))
+}
+
+/// Serde helper for an optional relay field accepting what [`parse_relay`] does.
+pub fn de_relay<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<RelayUrl>, D::Error> {
+    Option::<String>::deserialize(d)?.map(|s| parse_relay(&s).map_err(serde::de::Error::custom)).transpose()
+}
+
+/// How long our relay may be unreachable before n0's relays are added.
+const RELAY_GRACE: Duration = Duration::from_secs(20);
+
+/// Keeps `ours` as the home relay: adds n0's relays once it has been down for [`RELAY_GRACE`],
+/// and removes them when it is back (iroh then rehomes to the closest relay left, i.e. ours).
+/// While on n0, ours is retried after 1 minute, doubling up to 30 if it keeps failing.
+async fn prefer_relay(ep: Endpoint, ours: RelayUrl) {
+    use iroh::Watcher as _;
+    let n0 = iroh::defaults::prod::default_relay_map();
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let mut down_since: Option<Instant> = None;
+    let mut fallback = false;
+    let mut retry = Duration::from_secs(60);
+    let mut next_try = Instant::now();
+    while !ep.is_closed() {
+        tick.tick().await;
+        let up = ep.home_relay_status().get().iter().any(|s| s.url() == &ours && s.is_connected());
+        if up {
+            down_since = None;
+            retry = Duration::from_secs(60);
+        }
+        if !fallback {
+            if !up && down_since.get_or_insert_with(Instant::now).elapsed() >= RELAY_GRACE {
+                eprintln!("relay {ours} unreachable; falling back to n0's relays");
+                for cfg in n0.relays::<Vec<_>>() {
+                    ep.insert_relay(cfg.url.clone(), cfg).await;
+                }
+                fallback = true;
+                next_try = Instant::now() + retry;
+                retry = (retry * 2).min(Duration::from_secs(30 * 60));
+            }
+        } else if up || (Instant::now() >= next_try && reachable(&ours).await) {
+            eprintln!("relay {ours} is back; leaving n0's relays");
+            for url in n0.urls::<Vec<_>>() {
+                ep.remove_relay(&url).await;
+            }
+            fallback = false;
+            down_since = None;
+        }
+    }
+}
+
+/// Whether `relay` accepts TCP connections.
+// ponytail: TCP connect, not a relay handshake; a relay that accepts but fails is caught by
+// RELAY_GRACE and retried with backoff.
+async fn reachable(relay: &RelayUrl) -> bool {
+    let (Some(host), Some(port)) = (relay.host_str(), relay.port_or_known_default()) else { return false };
+    matches!(timeout(Duration::from_secs(5), TcpStream::connect((host, port))).await, Ok(Ok(_)))
 }
 
 /// Logs the connection's selected path (direct UDP or relay) each time it changes.
@@ -226,18 +293,41 @@ impl std::fmt::Display for InviteRejected {
 
 impl std::error::Error for InviteRejected {}
 
-/// What a client pastes: the server's id and the token.
-pub fn invite_code(server: EndpointId, token: &str) -> String {
-    format!("{server}.{token}")
+/// What a client pastes: `<server id>.<token>`, then `@<host[:port]>` of the server's relay if it
+/// has one (always https).
+pub fn invite_code(server: EndpointId, token: &str, relay: Option<&RelayUrl>) -> String {
+    let relay = relay.and_then(|r| {
+        let host = r.host_str()?.trim_end_matches('.');
+        Some(match r.port() {
+            Some(port) => format!("@{host}:{port}"),
+            None => format!("@{host}"),
+        })
+    });
+    format!("{server}.{token}{}", relay.unwrap_or_default())
 }
 
-/// The server and token of an invite code found anywhere in `text` (e.g. a pasted message).
-pub fn parse_invite(text: &str) -> Option<(EndpointId, String)> {
+/// A parsed invite code: see [`invite_code`].
+#[derive(Debug, PartialEq)]
+pub struct Invite {
+    pub server: EndpointId,
+    pub token: String,
+    pub relay: Option<RelayUrl>,
+}
+
+/// The invite code found anywhere in `text` (e.g. a pasted message).
+pub fn parse_invite(text: &str) -> Option<Invite> {
     let hex = |s: &str, n| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
-    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '.').find_map(|word| {
-        let (server, token) = word.split_once('.')?;
+    let word_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '@' | ':' | '-');
+    text.split(|c: char| !word_char(c)).find_map(|word| {
+        let word = word.trim_end_matches(['.', ':']); // end of a sentence
+        let (code, relay) = word.split_once('@').map_or((word, None), |(c, r)| (c, Some(r)));
+        let (server, token) = code.split_once('.')?;
         (hex(server, 64) && hex(token, 32)).then_some(())?;
-        Some((server.to_ascii_lowercase().parse().ok()?, token.to_ascii_lowercase()))
+        Some(Invite {
+            server: server.to_ascii_lowercase().parse().ok()?,
+            token: token.to_ascii_lowercase(),
+            relay: relay.and_then(|r| parse_relay(r).ok()),
+        })
     })
 }
 
@@ -781,4 +871,24 @@ pub fn forward_in_background(
         })
     })?;
     rx.recv()?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invite_codes_carry_the_relay() {
+        let server = SecretKey::from_bytes(&[1; 32]).public();
+        let token = "0123456789abcdef0123456789abcdef";
+        let plain = invite_code(server, token, None);
+        assert_eq!(parse_invite(&format!("Join: {plain}.")), Some(Invite { server, token: token.into(), relay: None }));
+
+        for url in ["https://relay.example.com", "https://relay.example.com:8443"] {
+            let relay: RelayUrl = url.parse().unwrap();
+            let code = invite_code(server, token, Some(&relay));
+            let got = parse_invite(&format!("\"{code}\".")).unwrap();
+            assert_eq!((got.server, got.token.as_str(), got.relay), (server, token, Some(relay)));
+        }
+    }
 }

@@ -1,7 +1,7 @@
 // Needs internet: peers find each other via n0 DNS/relays, like in real use.
 use std::{collections::HashMap, time::Duration};
 
-use iroh_proxy::{Client, Key, ServerConfig, Service, create_invite, serve};
+use iroh_proxy::{Client, Key, ServerConfig, Service, bind, create_invite, serve};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -171,4 +171,21 @@ async fn invites_let_new_clients_in_once() {
     assert!(again.services().await.is_ok());
     assert!(std::fs::read_to_string(dir.join("allowed")).unwrap().contains("mom-phone"));
     _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_relay_falls_back_to_n0() {
+    use iroh::Watcher as _;
+    let ep = bind(Key::generate(), Some("https://relay.invalid".parse().unwrap())).await.unwrap();
+    let mut status = ep.home_relay_status();
+    let homed = timeout(Duration::from_secs(60), async {
+        loop {
+            if let Some(s) = status.get().into_iter().find(|s| s.is_connected()) {
+                return s.url().clone();
+            }
+            status.updated().await.unwrap();
+        }
+    });
+    let url = homed.await.expect("no relay after falling back");
+    assert_ne!(url.host_str(), Some("relay.invalid"));
 }

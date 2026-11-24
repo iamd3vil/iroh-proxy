@@ -57,6 +57,7 @@ class ProxyService : VpnService() {
         val vpn = spec == null || intent?.getBooleanExtra(EXTRA_VPN, false) == true
         worker.execute {
             val result = runCatching {
+                Native.setRelay(prefs.relay)
                 Native.start(prefs.keyPath, spec ?: savedSpec(prefs)).also { if (vpn) startVpn() }
             }
             main.post {

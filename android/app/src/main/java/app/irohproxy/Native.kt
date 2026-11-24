@@ -31,6 +31,10 @@ object Native {
     /** The real network's DNS servers, one IP per line, for names the VPN doesn't answer. */
     external fun setDns(servers: String)
 
+    /** The relay to prefer over n0's public ones ("" for none): a URL, or a host for https.
+     *  Applies to the next connection; throws if it isn't valid. */
+    external fun setRelay(url: String): String
+
     /** Each connected server's path: `<server> direct|relay <addr> <rtt ms>` lines. */
     external fun paths(): String
 
@@ -58,12 +62,15 @@ data class Server(val id: String, val name: String) {
 /** The server's own name from its listing, if it has one. */
 fun serverName(listing: String) = listing.lines().firstOrNull { it.startsWith("name ") }?.removePrefix("name ")
 
-/** An invite code (`<server id>.<token>`) found anywhere in a pasted message. */
+/** An invite code (`<server id>.<token>[@<relay host[:port]>]`) found anywhere in a pasted message. */
 object Invite {
-    private val CODE = Regex("([0-9a-fA-F]{64})\\.([0-9a-fA-F]{32})")
+    private val CODE = Regex("([0-9a-fA-F]{64})\\.([0-9a-fA-F]{32})(?:@([A-Za-z0-9.-]*[A-Za-z0-9](?::[0-9]+)?))?")
 
     /** The server id of the invite in [text], if there is one. */
     fun server(text: String) = CODE.find(text)?.groupValues?.get(1)?.lowercase()
+
+    /** The server's relay named in the invite in [text], as a URL, if there is one. */
+    fun relay(text: String) = CODE.find(text)?.groupValues?.get(3)?.ifEmpty { null }?.let { "https://$it" }
 }
 
 /** A service offered by [server]; [port] is its suggested local port. [hostnames] are reached
@@ -128,6 +135,11 @@ class Prefs(ctx: Context) {
             ?.lines()?.filter { it.isNotBlank() }?.map { Server(it.substringBefore('\t'), it.substringAfter('\t', "")) }
             ?: listOfNotNull(p.getString("server", null)?.takeIf { it.isNotBlank() }?.let { Server(it, "") })
         set(v) = p.edit().putString("servers", v.joinToString("\n") { "${it.id}\t${it.name}" }).remove("server").apply()
+
+    /** The relay to prefer over n0's ("" for none); see [Native.setRelay]. */
+    var relay: String
+        get() = p.getString("relay", "")!!
+        set(v) = p.edit().putString("relay", v.trim()).apply()
 
     /** The user's local port override for a service, if any. */
     fun port(svc: Svc): Int? = if (p.contains("port:${svc.key}")) p.getInt("port:${svc.key}", 0) else null
