@@ -1,0 +1,42 @@
+releases:
+  - name: "Release to github"
+    dist_folder: "./dist"
+    targets:
+      github:
+        owner: "iamd3vil"
+        repo: "iroh-proxy"
+    checksum:
+      algorithm: "sha256"
+    additional_files:
+      - "README.md"
+      - "LICENSE"
+    builds:
+      - name: "Linux x86_64"
+        target: "x86_64-unknown-linux-musl"
+        command: "cargo build --locked --release --target x86_64-unknown-linux-musl"
+        artifact: "target/x86_64-unknown-linux-musl/release/iroh-proxy"
+        bin_name: "iroh-proxy"
+        archive_name: "iroh-proxy-{{ meta.tag }}-linux-musl-x86_64"
+        archive_format: "tar_gz"
+      - name: "Linux arm64"
+        target: "aarch64-unknown-linux-musl"
+        env:
+          # Support 4 KB, 16 KB (e.g. Raspberry Pi 5), and 64 KB ARM64 kernels.
+          - "JEMALLOC_SYS_WITH_LG_PAGE=16"
+        command: "cargo build --locked --release --target aarch64-unknown-linux-musl"
+        artifact: "target/aarch64-unknown-linux-musl/release/iroh-proxy"
+        bin_name: "iroh-proxy"
+        archive_name: "iroh-proxy-{{ meta.tag }}-linux-musl-arm64"
+        archive_format: "tar_gz"
+      - name: "macOS arm64"
+        target: "aarch64-apple-darwin"
+        command: "cargo build --locked --release --target aarch64-apple-darwin"
+        artifact: "target/aarch64-apple-darwin/release/iroh-proxy"
+        bin_name: "iroh-proxy"
+        archive_name: "iroh-proxy-{{ meta.tag }}-macos-arm64"
+        archive_format: "tar_gz"
+changelog:
+  format: "github"
+  exclude:
+    - "^ci(\\(|:)"
+    - "^chore(\\(|:)"

@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual runs build and package everything without publishing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - name: linux-arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - name: macos-arm64
+            target: aarch64-apple-darwin
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build and package
+        uses: iamd3vil/rlsr/.github/actions/rlsr@v0.11.0
+        env:
+          # cc-rs falls back to musl-gcc for x86_64-unknown-linux-musl, but not for aarch64.
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        with:
+          config: rlsr.yml
+          rm_dist: true
+          args: --split --targets ${{ matrix.target }} ${{ github.event_name != 'push' && '--snapshot' || '' }}
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Checksum and publish
+        uses: iamd3vil/rlsr/.github/actions/rlsr@v0.11.0
+        with:
+          config: rlsr.yml
+          publish: ${{ github.event_name == 'push' }}
+          args: --merge ${{ github.event_name != 'push' && '--snapshot' || '' }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
