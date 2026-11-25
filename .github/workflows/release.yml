@@ -13,6 +13,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: linux-x86_64
@@ -41,15 +42,19 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Build and package
-        uses: iamd3vil/rlsr/.github/actions/rlsr@v0.11.0
+      - name: Build
         env:
-          # cc-rs falls back to musl-gcc for x86_64-unknown-linux-musl, but not for aarch64.
           CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          AARCH64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_LG_PAGE: "16"
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package
+        uses: iamd3vil/rlsr/.github/actions/rlsr@v0.11.0
         with:
           config: rlsr.yml
           rm_dist: true
-          args: --split --targets ${{ matrix.target }} ${{ github.event_name != 'push' && '--snapshot' || '' }}
+          args: --split --skip-build --targets ${{ matrix.target }} ${{ github.event_name != 'push' && '--snapshot' || '' }}
 
       - name: Upload dist
         uses: actions/upload-artifact@v4
