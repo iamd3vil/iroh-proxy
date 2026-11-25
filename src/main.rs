@@ -12,6 +12,10 @@ use iroh_proxy::{
 };
 use serde::Deserialize;
 
+#[cfg(all(unix, not(target_os = "android")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Deserialize)]
 struct ServerFile {
     key_file: String,
