@@ -23,6 +23,7 @@ releases:
         env:
           # Support 4 KB, 16 KB (e.g. Raspberry Pi 5), and 64 KB ARM64 kernels.
           - "JEMALLOC_SYS_WITH_LG_PAGE=16"
+          - "CFLAGS_aarch64_unknown_linux_musl=-mno-outline-atomics"
         command: "cargo build --locked --release --target aarch64-unknown-linux-musl"
         artifact: "target/aarch64-unknown-linux-musl/release/iroh-proxy"
         bin_name: "iroh-proxy"
